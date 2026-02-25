@@ -1,0 +1,133 @@
+//! VOIDWEB — RMSNorm kernel
+//!
+//! RMS Layer Normalisation as used in LLaMA, Qwen, Mistral, etc.
+//!
+//!   y = x / RMS(x) * weight
+//!   RMS(x) = sqrt(mean(x²) + eps)
+//!
+//! One warp (32 threads) reduces a single row (one token embedding).
+//! Uses warp shuffle for the reduction — no shared memory needed.
+
+use std::gpu
+use std::simd
+use std::math
+
+// ── RMSNorm kernel ────────────────────────────────────────────────────────────
+
+/// Apply RMSNorm in-place.
+///
+/// x:       [batch * seq_len, hidden_size]   — modified in place
+/// weight:  [hidden_size]                    — learned scale
+/// eps:     rms_norm_eps (typically 1e-5)
+#[kernel(threads = [32, 1, 1])]   // one warp per row
+fn rms_norm_fwd(
+    x:      &mut tensor<f16, [ROWS, HIDDEN]> @global,
+    weight: &tensor<f16, [HIDDEN]>           @global,
+    eps:    f32,
+) {
+    let row = @block.x
+    if row >= ROWS { return }
+
+    let lane  = @thread.x   // 0..31
+
+    // ── Step 1: Compute sum of squares (warp reduction) ───────────────────────
+    var sum_sq: f32 = 0.0
+    for d in (lane..HIDDEN).step_by(32) {
+        let v = x[row, d] as f32
+        sum_sq += v * v
+    }
+
+    // Warp-level reduction (butterfly pattern via shuffle)
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq, 16)
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq,  8)
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq,  4)
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq,  2)
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq,  1)
+
+    let inv_rms = 1.0 / (sum_sq / HIDDEN as f32 + eps).sqrt()
+
+    // ── Step 2: Apply normalisation + weight ──────────────────────────────────
+    for d in (lane..HIDDEN).step_by(32) {
+        let v  = x[row, d] as f32
+        let w  = weight[d]  as f32
+        x[row, d] = (v * inv_rms * w) as f16
+    }
+}
+
+// ── FP8 variant (H100 / Ada) ──────────────────────────────────────────────────
+
+/// RMSNorm with FP8 output for quantised pipelines.
+/// Writes normalised+scaled values into fp8_out for the quantised GEMM.
+#[kernel(threads = [32, 1, 1])]
+fn rms_norm_fp8_out(
+    x:       &tensor<f16, [ROWS, HIDDEN]>      @global,
+    weight:  &tensor<f16, [HIDDEN]>            @global,
+    fp8_out: &mut tensor<u8, [ROWS, HIDDEN]>   @global,   // e4m3
+    scale:   f32,     // per-tensor scale for fp8 quantisation
+    eps:     f32,
+) {
+    let row  = @block.x
+    if row >= ROWS { return }
+    let lane = @thread.x
+
+    var sum_sq: f32 = 0.0
+    for d in (lane..HIDDEN).step_by(32) {
+        let v = x[row, d] as f32
+        sum_sq += v * v
+    }
+
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq, 16)
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq,  8)
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq,  4)
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq,  2)
+    sum_sq += __shfl_xor_sync(0xFFFF_FFFF, sum_sq,  1)
+
+    let inv_rms = 1.0 / (sum_sq / HIDDEN as f32 + eps).sqrt()
+
+    for d in (lane..HIDDEN).step_by(32) {
+        let v     = x[row, d] as f32
+        let w     = weight[d]  as f32
+        let normed = v * inv_rms * w * scale
+        fp8_out[row, d] = f32_to_fp8_e4m3(normed)
+    }
+}
+
+// ── FP8 E4M3 quantisation helper ──────────────────────────────────────────────
+
+/// Saturating cast f32 → FP8 E4M3 (max representable value = 448.0).
+pure fn f32_to_fp8_e4m3(x: f32) -> u8 {
+    const FP8_MAX: f32 = 448.0
+    let clamped = x.clamp(-FP8_MAX, FP8_MAX)
+    // Bit manipulation: sign(1) | exponent(4) | mantissa(3)
+    let bits = clamped.to_bits()
+    let sign  = (bits >> 31) as u8
+    let exp   = ((bits >> 23) & 0xFF) as i32 - 127 + 7   // rebias to E4 (bias=7)
+    let mant  = ((bits >> 20) & 0x7) as u8                // top 3 mantissa bits
+    if exp <= 0 {
+        0u8   // underflow → zero
+    } else if exp >= 15 {
+        (sign << 7) | (0xF << 3) | 0x7   // overflow → max
+    } else {
+        (sign << 7) | ((exp as u8) << 3) | mant
+    }
+}
+
+// ── Host dispatch ──────────────────────────────────────────────────────────────
+
+pub fn launch_rms_norm(
+    x:      &mut tensor<f16, [ROWS, HIDDEN]> @device,
+    weight: &tensor<f16, [HIDDEN]>           @device,
+    eps:    f32,
+) !IO {
+    rms_norm_fwd.launch([ROWS, 1, 1], x, weight, eps)
+}
+
+pub fn launch_rms_norm_fp8(
+    x:       &tensor<f16, [ROWS, HIDDEN]>    @device,
+    weight:  &tensor<f16, [HIDDEN]>          @device,
+    fp8_out: &mut tensor<u8, [ROWS, HIDDEN]> @device,
+    scale:   f32,
+    eps:     f32,
+) !IO {
+    rms_norm_fp8_out.launch([ROWS, 1, 1], x, weight, fp8_out, scale, eps)
+}

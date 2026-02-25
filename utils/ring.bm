@@ -1,0 +1,137 @@
+//! VOIDWEB — Lock-free ring buffer
+//!
+//! SPSC (single-producer, single-consumer) and MPMC variants.
+//! Used for:
+//!   - Streaming token output from engine to HTTP handler
+//!   - Request ingestion from HTTP threads to scheduler
+//!
+//! Capacity must be a power of two (enables cheap modular indexing).
+
+use std::sync
+
+// ── Comptime power-of-two check ───────────────────────────────────────────────
+
+comptime fn is_pow2(n: usize) -> bool {
+    n > 0 and (n & (n - 1)) == 0
+}
+
+// ── SPSC ring buffer ──────────────────────────────────────────────────────────
+
+/// Lock-free single-producer single-consumer ring buffer.
+pub struct SpscRing<T, const CAP: usize> where comptime is_pow2(CAP) {
+    data:  [T; CAP],
+    head:  atomic usize,   // consumer reads from here
+    tail:  atomic usize,   // producer writes to here
+}
+
+impl<T, const CAP: usize> SpscRing<T, CAP> {
+    pub fn new() -> SpscRing<T, CAP> {
+        SpscRing {
+            data: std::mem::uninit(),
+            head: atomic(0usize),
+            tail: atomic(0usize),
+        }
+    }
+
+    /// Try to push a value. Returns false if full.
+    pub fn push(self: &SpscRing<T, CAP>, val: T) -> bool {
+        let tail = self.tail.load(.Relaxed)
+        let next = (tail + 1) & (CAP - 1)
+        if next == self.head.load(.Acquire) { return false }   // full
+        self.data[tail] = val
+        self.tail.store(next, .Release)
+        true
+    }
+
+    /// Try to pop a value. Returns None if empty.
+    pub fn pop(self: &SpscRing<T, CAP>) -> ?T {
+        let head = self.head.load(.Relaxed)
+        if head == self.tail.load(.Acquire) { return .None }   // empty
+        let val  = self.data[head]
+        self.head.store((head + 1) & (CAP - 1), .Release)
+        .Some(val)
+    }
+
+    pub fn is_empty(self: &SpscRing<T, CAP>) -> bool {
+        self.head.load(.Relaxed) == self.tail.load(.Acquire)
+    }
+
+    pub fn len(self: &SpscRing<T, CAP>) -> usize {
+        let tail = self.tail.load(.Acquire)
+        let head = self.head.load(.Acquire)
+        (tail.wrapping_sub(head)) & (CAP - 1)
+    }
+}
+
+// ── MPMC ring buffer ──────────────────────────────────────────────────────────
+
+/// Lock-free multi-producer multi-consumer ring buffer (Dmitry Vyukov design).
+pub struct MpmcRing<T, const CAP: usize> where comptime is_pow2(CAP) {
+    buffer:   [Cell<T>; CAP],
+    enqueue:  atomic usize,
+    dequeue:  atomic usize,
+}
+
+#[align(64)]
+struct Cell<T> {
+    sequence: atomic usize,
+    data:     T,
+}
+
+impl<T, const CAP: usize> MpmcRing<T, CAP> {
+    pub fn new() -> MpmcRing<T, CAP> {
+        let mut ring: MpmcRing<T, CAP> = std::mem::uninit()
+        ring.enqueue.store(0, .Relaxed)
+        ring.dequeue.store(0, .Relaxed)
+        for i in 0..CAP {
+            ring.buffer[i].sequence.store(i, .Relaxed)
+        }
+        ring
+    }
+
+    pub fn push(self: &MpmcRing<T, CAP>, val: T) -> bool {
+        loop {
+            let pos  = self.enqueue.load(.Relaxed)
+            let cell = &self.buffer[pos & (CAP - 1)]
+            let seq  = cell.sequence.load(.Acquire)
+            let diff = seq as isize - pos as isize
+
+            if diff == 0 {
+                if self.enqueue.compare_exchange(pos, pos + 1, .Relaxed, .Relaxed).is_ok() {
+                    cell.data = val
+                    cell.sequence.store(pos + 1, .Release)
+                    return true
+                }
+            } else if diff < 0 {
+                return false   // full
+            }
+        }
+    }
+
+    pub fn pop(self: &MpmcRing<T, CAP>) -> ?T {
+        loop {
+            let pos  = self.dequeue.load(.Relaxed)
+            let cell = &self.buffer[pos & (CAP - 1)]
+            let seq  = cell.sequence.load(.Acquire)
+            let diff = seq as isize - (pos + 1) as isize
+
+            if diff == 0 {
+                if self.dequeue.compare_exchange(pos, pos + 1, .Relaxed, .Relaxed).is_ok() {
+                    let val = cell.data
+                    cell.sequence.store(pos + CAP, .Release)
+                    return .Some(val)
+                }
+            } else if diff < 0 {
+                return .None   // empty
+            }
+        }
+    }
+}
+
+// ── Common instantiations ─────────────────────────────────────────────────────
+
+/// Token stream from engine → HTTP handler (256 slots, SPSC per request).
+pub type TokenRing = SpscRing<u32, 256>
+
+/// Request queue from HTTP → scheduler (4096 slots, MPMC).
+pub type RequestRing<T> = MpmcRing<T, 4096>

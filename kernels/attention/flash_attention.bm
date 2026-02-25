@@ -1,0 +1,186 @@
+//! VOIDWEB — Flash Attention kernel
+//!
+//! FlashAttention-2 algorithm — tiled softmax with online normalisation.
+//! Eliminates the O(N²) intermediate attention matrix from HBM.
+//!
+//! Tiling strategy:
+//!   - BLOCK_Q  = 64  query tokens per tile
+//!   - BLOCK_KV = 64  KV tokens per tile
+//!   - Each SM handles one (batch, head) pair independently
+
+use std::gpu
+use std::simd
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const BLOCK_Q:  usize = 64
+const BLOCK_KV: usize = 64
+const HEAD_DIM: usize = 128   // typical for LLaMA/Qwen — override via comptime
+
+// ── Flash Attention forward kernel ────────────────────────────────────────────
+
+/// Compute attention output O = softmax(Q K^T / sqrt(d)) V for one head.
+///
+/// q:     [seq_q, head_dim]  @global
+/// k:     [seq_kv, head_dim] @global  (paged: block_table maps logical→physical)
+/// v:     [seq_kv, head_dim] @global
+/// o:     [seq_q, head_dim]  @global  (output)
+/// scale: 1 / sqrt(head_dim)
+#[kernel(threads = [BLOCK_Q, 1, 1])]
+fn flash_attention_fwd(
+    q:           &tensor<f16, [SEQ_Q, HEAD_DIM]>  @global,
+    k:           &tensor<f16, [SEQ_KV, HEAD_DIM]> @global,
+    v:           &tensor<f16, [SEQ_KV, HEAD_DIM]> @global,
+    o:           &mut tensor<f16, [SEQ_Q, HEAD_DIM]> @global,
+    block_table: &tensor<u32, [NUM_BLOCKS]>        @global,
+    seq_q:       u32,
+    seq_kv:      u32,
+    scale:       f32,
+) {
+    let q_idx = @block.x * BLOCK_Q + @thread.x
+    if q_idx >= seq_q as usize { return }
+
+    // Shared memory tiles for SRAM-resident computation
+    var q_tile: [f32; HEAD_DIM]  @shared
+    var o_tile: [f32; HEAD_DIM]  @shared
+    var m_i:    f32 = f32::NEG_INFINITY   // running max (online softmax)
+    var l_i:    f32 = 0.0                 // running sum
+
+    // Load Q tile for this thread into shared memory
+    for d in 0..HEAD_DIM {
+        q_tile[d] = q[q_idx, d] as f32
+        o_tile[d] = 0.0
+    }
+
+    // Iterate over KV tiles
+    let num_kv_tiles = (seq_kv as usize + BLOCK_KV - 1) / BLOCK_KV
+    for tile in 0..num_kv_tiles {
+        var s_tile: [f32; BLOCK_KV] @shared   // attention scores for this tile
+
+        // Compute QK^T for this tile (GEMV)
+        for kv in 0..BLOCK_KV {
+            let kv_idx = tile * BLOCK_KV + kv
+            if kv_idx >= seq_kv as usize { s_tile[kv] = f32::NEG_INFINITY; continue }
+
+            var dot: f32 = 0.0
+            for d in 0..HEAD_DIM {
+                dot += q_tile[d] * k[kv_idx, d] as f32
+            }
+            s_tile[kv] = dot * scale
+        }
+
+        // Online softmax update (FlashAttention-2 algorithm)
+        let m_new = f32::NEG_INFINITY
+            .max(s_tile.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+
+        let exp_sum: f32 = s_tile.iter().map(fn(&s) (s - m_new).exp()).sum()
+        let alpha    = (m_i - m_new).exp()
+
+        // Rescale running output and accumulate
+        for d in 0..HEAD_DIM {
+            o_tile[d] *= alpha
+
+            var acc: f32 = 0.0
+            for kv in 0..BLOCK_KV {
+                let kv_idx = tile * BLOCK_KV + kv
+                if kv_idx < seq_kv as usize {
+                    let p = (s_tile[kv] - m_new).exp()
+                    acc += p * v[kv_idx, d] as f32
+                }
+            }
+            o_tile[d] += acc
+        }
+
+        l_i = alpha * l_i + exp_sum
+        m_i = m_new
+    }
+
+    // Write normalised output
+    let inv_l = 1.0 / l_i
+    for d in 0..HEAD_DIM {
+        o[q_idx, d] = (o_tile[d] * inv_l) as f16
+    }
+}
+
+// ── PagedAttention decode kernel ──────────────────────────────────────────────
+//
+// Decode variant: q has exactly 1 token per sequence.
+// Iterates over paged KV blocks (16 tokens per block) via block_table.
+
+#[kernel(threads = [HEAD_DIM, 1, 1])]
+fn paged_attention_decode(
+    q:           &tensor<f16, [BATCH, HEAD_DIM]>   @global,   // [batch, head_dim]
+    kv_cache:    &tensor<f16, [TOTAL_BLOCKS, 2, BLOCK_SIZE, HEAD_DIM]> @global,
+    block_table: &tensor<u32, [BATCH, MAX_BLOCKS]> @global,
+    seq_lens:    &tensor<u32, [BATCH]>             @global,
+    o:           &mut tensor<f16, [BATCH, HEAD_DIM]> @global,
+    scale:       f32,
+) {
+    let batch_idx = @block.x
+    let d_idx     = @thread.x
+
+    let seq_len = seq_lens[batch_idx] as usize
+    var q_d: f32 = q[batch_idx, d_idx] as f32
+
+    var acc:  f32 = 0.0
+    var m_i:  f32 = f32::NEG_INFINITY
+    var l_i:  f32 = 0.0
+
+    let num_blocks = (seq_len + 15) / 16   // ceil(seq_len / block_size)
+
+    for blk in 0..num_blocks {
+        let phys_blk = block_table[batch_idx, blk] as usize
+        let tokens_in_block = if blk == num_blocks - 1 {
+            seq_len - blk * 16
+        } else {
+            16
+        }
+
+        for t in 0..tokens_in_block {
+            // Compute Q·K[blk, t]
+            var dot: f32 = 0.0
+            for dd in 0..HEAD_DIM {
+                dot += q[batch_idx, dd] as f32 * kv_cache[phys_blk, 0, t, dd] as f32
+            }
+            let s = dot * scale
+
+            // Online softmax update
+            let m_new = m_i.max(s)
+            let exp_s = (s - m_new).exp()
+            let alpha  = (m_i - m_new).exp()
+
+            acc  = alpha * acc + exp_s * kv_cache[phys_blk, 1, t, d_idx] as f32
+            l_i  = alpha * l_i + exp_s
+            m_i  = m_new
+        }
+    }
+
+    o[batch_idx, d_idx] = (acc / l_i) as f16
+}
+
+// ── Host dispatch ──────────────────────────────────────────────────────────────
+
+/// Launch FlashAttention for prefill (multiple Q tokens per sequence).
+pub fn launch_flash_attn_prefill(
+    q:           &tensor<f16, [SEQ_Q, HEAD_DIM]>  @device,
+    k:           &tensor<f16, [SEQ_KV, HEAD_DIM]> @device,
+    v:           &tensor<f16, [SEQ_KV, HEAD_DIM]> @device,
+    o:           &mut tensor<f16, [SEQ_Q, HEAD_DIM]> @device,
+    block_table: &tensor<u32, [NUM_BLOCKS]>        @device,
+) !IO {
+    let scale   = 1.0 / (HEAD_DIM as f32).sqrt()
+    let grid_x  = (SEQ_Q + BLOCK_Q - 1) / BLOCK_Q
+    flash_attention_fwd.launch([grid_x, 1, 1], q, k, v, o, block_table, SEQ_Q as u32, SEQ_KV as u32, scale)
+}
+
+/// Launch PagedAttention for decode (1 Q token per sequence).
+pub fn launch_paged_attn_decode(
+    q:           &tensor<f16, [BATCH, HEAD_DIM]>   @device,
+    kv_cache:    &tensor<f16, [TOTAL_BLOCKS, 2, BLOCK_SIZE, HEAD_DIM]> @device,
+    block_table: &tensor<u32, [BATCH, MAX_BLOCKS]> @device,
+    seq_lens:    &tensor<u32, [BATCH]>             @device,
+    o:           &mut tensor<f16, [BATCH, HEAD_DIM]> @device,
+) !IO {
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt()
+    paged_attention_decode.launch([BATCH, 1, 1], q, kv_cache, block_table, seq_lens, o, scale)
+}

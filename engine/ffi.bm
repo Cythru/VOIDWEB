@@ -1,0 +1,117 @@
+//! VOIDWEB — GPU kernel FFI bridge
+//!
+//! Dynamically loads the compiled kernel library and dispatches
+//! forward-pass calls to the GPU via a C-ABI boundary.
+
+use std::io
+use engine::kv_cache::BlockManager
+use scheduler::BatchView
+use engine::engine::ModelConfig
+
+// ── C-ABI types mirrored from the kernel header ───────────────────────────────
+
+#[repr(C)]
+#[packed]
+pub struct SeqDescriptor {
+    pub seq_id:     u64,
+    pub token_ptr:  usize,
+    pub num_tokens: u32,
+    pub block_ptr:  usize,
+    pub num_blocks: u32,
+    pub is_prefill: u8,
+}
+
+#[repr(C)]
+#[packed]
+pub struct ForwardArgs {
+    pub seqs:         *const SeqDescriptor,
+    pub num_seqs:     u32,
+    pub hidden_size:  u32,
+    pub num_heads:    u32,
+    pub num_kv_heads: u32,
+    pub num_layers:   u32,
+    pub vocab_size:   u32,
+    pub head_dim:     u32,
+    pub rope_theta:   f32,
+    pub quant_type:   u32,
+    pub logits_out:   *mut f32,
+}
+
+// ── Kernel library handle ─────────────────────────────────────────────────────
+
+/// Dynamically-loaded GPU kernel library.
+linear struct KernelLib {
+    handle:       *mut void,
+    forward_pass: fn(*const ForwardArgs) -> i32,
+}
+
+extern "C" {
+    fn dlopen(path: *const u8, flags: i32) -> *mut void
+    fn dlsym(handle: *mut void, symbol: *const u8) -> *mut void
+    fn dlclose(handle: *mut void) -> i32
+}
+
+const RTLD_LAZY: i32 = 1
+const RTLD_NOW:  i32 = 2
+
+impl KernelLib {
+    /// Open the kernel shared library by path.
+    pub fn open(path: str) -> Result<KernelLib, str> !IO {
+        unsafe {
+            let handle = dlopen(path.as_ptr(), RTLD_NOW)
+            if handle == null {
+                return Err("dlopen failed for {path}")
+            }
+            let sym = dlsym(handle, b"voidweb_forward_pass\0".as_ptr())
+            if sym == null {
+                dlclose(handle)
+                return Err("voidweb_forward_pass not found in {path}")
+            }
+            let forward_pass = sym as fn(*const ForwardArgs) -> i32
+            Ok(KernelLib { handle, forward_pass })
+        }
+    }
+
+    /// Close (consumes the linear type — must be called exactly once).
+    pub fn close(self) -> void !IO {
+        unsafe { dlclose(self.handle) }
+    }
+
+    /// Run the full transformer forward pass for the given batch.
+    /// Returns a flat logit buffer: [num_seqs × vocab_size] f32.
+    pub fn forward_pass(
+        self:      &KernelLib,
+        cfg:       &ModelConfig,
+        batch:     &BatchView,
+        block_mgr: &BlockManager,
+    ) -> Result<Vec<f32>, str> !IO {
+        let num_seqs   = batch.num_seqs()
+        let vocab_size = cfg.vocab_size
+        let mut logits = Vec::with_len(num_seqs * vocab_size, 0.0f32)
+
+        let (descs, _tok_storage, _blk_storage) = batch.build_seq_descriptors()
+
+        let args = ForwardArgs {
+            seqs:         descs.as_ptr() as *const SeqDescriptor,
+            num_seqs:     num_seqs as u32,
+            hidden_size:  cfg.hidden_size as u32,
+            num_heads:    cfg.num_heads as u32,
+            num_kv_heads: cfg.num_kv_heads as u32,
+            num_layers:   cfg.num_layers as u32,
+            vocab_size:   vocab_size as u32,
+            head_dim:     cfg.head_dim() as u32,
+            rope_theta:   cfg.rope_theta,
+            quant_type:   cfg.quant_scheme as u32,
+            logits_out:   logits.as_mut_ptr(),
+        }
+
+        unsafe {
+            let rc = (self.forward_pass)(&args)
+            if rc != 0 {
+                return Err("GPU forward pass failed with code {rc}")
+            }
+        }
+
+        Ok(logits)
+    }
+}

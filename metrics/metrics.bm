@@ -1,0 +1,130 @@
+//! VOIDWEB — Prometheus-compatible metrics
+//!
+//! Tracks per-request and aggregate performance:
+//!   - TTFT         — time-to-first-token (µs)
+//!   - ITL          — inter-token latency (µs / token)
+//!   - Throughput   — tokens / second
+//!   - Cache hit rate — radix cache prefix reuse %
+//!   - Active requests, queue depth, KV cache utilisation
+//!
+//! Exposes a /metrics endpoint (Prometheus text format) via serve().
+
+use std::sync
+use std::time
+
+// ── Atomic counters ───────────────────────────────────────────────────────────
+
+pub struct Counters {
+    // Request lifecycle
+    pub requests_total:     atomic u64,
+    pub requests_active:    atomic usize,
+    pub requests_queued:    atomic usize,
+    pub tokens_generated:   atomic u64,
+    pub tokens_prefill:     atomic u64,
+
+    // Latency accumulators (µs)
+    pub ttft_sum_us:        atomic u64,
+    pub ttft_count:         atomic u64,
+    pub itl_sum_us:         atomic u64,
+    pub itl_count:          atomic u64,
+
+    // Cache
+    pub cache_hits:         atomic u64,
+    pub cache_misses:       atomic u64,
+    pub cache_blocks_used:  atomic usize,
+    pub cache_blocks_total: atomic usize,
+}
+
+impl Counters {
+    pub fn new() -> Counters {
+        Counters {
+            requests_total:     atomic(0u64),
+            requests_active:    atomic(0usize),
+            requests_queued:    atomic(0usize),
+            tokens_generated:   atomic(0u64),
+            tokens_prefill:     atomic(0u64),
+            ttft_sum_us:        atomic(0u64),
+            ttft_count:         atomic(0u64),
+            itl_sum_us:         atomic(0u64),
+            itl_count:          atomic(0u64),
+            cache_hits:         atomic(0u64),
+            cache_misses:       atomic(0u64),
+            cache_blocks_used:  atomic(0usize),
+            cache_blocks_total: atomic(0usize),
+        }
+    }
+
+    /// Record a TTFT measurement.
+    pub fn record_ttft(self: &Counters, micros: u64) {
+        self.ttft_sum_us.fetch_add(micros, .Relaxed)
+        self.ttft_count.fetch_add(1, .Relaxed)
+    }
+
+    /// Record an ITL measurement.
+    pub fn record_itl(self: &Counters, micros: u64) {
+        self.itl_sum_us.fetch_add(micros, .Relaxed)
+        self.itl_count.fetch_add(1, .Relaxed)
+    }
+
+    /// Mean TTFT in milliseconds.
+    pub fn mean_ttft_ms(self: &Counters) -> f64 {
+        let count = self.ttft_count.load(.Relaxed)
+        if count == 0 { return 0.0 }
+        self.ttft_sum_us.load(.Relaxed) as f64 / count as f64 / 1000.0
+    }
+
+    /// Mean ITL in milliseconds.
+    pub fn mean_itl_ms(self: &Counters) -> f64 {
+        let count = self.itl_count.load(.Relaxed)
+        if count == 0 { return 0.0 }
+        self.itl_sum_us.load(.Relaxed) as f64 / count as f64 / 1000.0
+    }
+
+    /// Cache hit rate as a fraction 0.0–1.0.
+    pub fn cache_hit_rate(self: &Counters) -> f64 {
+        let hits   = self.cache_hits.load(.Relaxed)   as f64
+        let misses = self.cache_misses.load(.Relaxed) as f64
+        let total  = hits + misses
+        if total == 0.0 { 0.0 } else { hits / total }
+    }
+}
+
+// ── Global metrics handle ─────────────────────────────────────────────────────
+
+static METRICS: Counters = Counters::new()
+
+pub fn metrics() -> &'static Counters { &METRICS }
+
+// ── Prometheus text format ────────────────────────────────────────────────────
+
+pub fn prometheus_text() -> str {
+    let m = metrics()
+    "# HELP voidweb_requests_total Total inference requests received
+# TYPE voidweb_requests_total counter
+voidweb_requests_total {m.requests_total.load(.Relaxed)}
+
+# HELP voidweb_requests_active Requests currently being processed
+# TYPE voidweb_requests_active gauge
+voidweb_requests_active {m.requests_active.load(.Relaxed)}
+
+# HELP voidweb_tokens_generated_total Total tokens generated
+# TYPE voidweb_tokens_generated_total counter
+voidweb_tokens_generated_total {m.tokens_generated.load(.Relaxed)}
+
+# HELP voidweb_ttft_ms_mean Mean time-to-first-token in milliseconds
+# TYPE voidweb_ttft_ms_mean gauge
+voidweb_ttft_ms_mean {m.mean_ttft_ms():.3}
+
+# HELP voidweb_itl_ms_mean Mean inter-token latency in milliseconds
+# TYPE voidweb_itl_ms_mean gauge
+voidweb_itl_ms_mean {m.mean_itl_ms():.3}
+
+# HELP voidweb_cache_hit_rate Radix KV-cache prefix hit rate (0.0-1.0)
+# TYPE voidweb_cache_hit_rate gauge
+voidweb_cache_hit_rate {m.cache_hit_rate():.4}
+
+# HELP voidweb_cache_blocks_used KV-cache blocks currently in use
+# TYPE voidweb_cache_blocks_used gauge
+voidweb_cache_blocks_used {m.cache_blocks_used.load(.Relaxed)}
+"
+}

@@ -1,0 +1,174 @@
+//! VOIDWEB — SIMD utility functions
+//!
+//! Vectorised math helpers used by the sampler, tokenizer, and loader.
+//! All functions specialise at comptime based on the target ISA
+//! (AVX-512 → AVX2 → NEON → scalar fallback).
+
+use std::simd
+use std::math
+
+// ── Horizontal operations ─────────────────────────────────────────────────────
+
+/// Horizontal sum of a f32 slice (SIMD accelerated).
+pub fn hsum_f32(xs: &[f32]) -> f32 {
+    comptime if std::target::has_avx512f() {
+        hsum_f32_avx512(xs)
+    } else if comptime std::target::has_avx2() {
+        hsum_f32_avx2(xs)
+    } else {
+        xs.iter().sum()
+    }
+}
+
+fn hsum_f32_avx512(xs: &[f32]) -> f32 {
+    let mut acc: vec16<f32> = vec16(0.0)
+    let chunks = xs.len() / 16
+    for i in 0..chunks {
+        let v: vec16<f32> = vec16::load_unaligned(&xs[i * 16])
+        acc = acc + v
+    }
+    var tail: f32 = acc.hadd()
+    for i in chunks * 16 .. xs.len() {
+        tail += xs[i]
+    }
+    tail
+}
+
+fn hsum_f32_avx2(xs: &[f32]) -> f32 {
+    let mut acc: vec8<f32> = vec8(0.0)
+    let chunks = xs.len() / 8
+    for i in 0..chunks {
+        let v: vec8<f32> = vec8::load_unaligned(&xs[i * 8])
+        acc = acc + v
+    }
+    var tail: f32 = acc.hadd()
+    for i in chunks * 8 .. xs.len() {
+        tail += xs[i]
+    }
+    tail
+}
+
+/// Horizontal max of a f32 slice.
+pub fn hmax_f32(xs: &[f32]) -> f32 {
+    comptime if std::target::has_avx2() {
+        let mut acc: vec8<f32> = vec8(f32::NEG_INFINITY)
+        let chunks = xs.len() / 8
+        for i in 0..chunks {
+            let v: vec8<f32> = vec8::load_unaligned(&xs[i * 8])
+            acc = acc.max(v)
+        }
+        var m = acc.hmax()
+        for i in chunks * 8 .. xs.len() {
+            if xs[i] > m { m = xs[i] }
+        }
+        m
+    } else {
+        xs.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    }
+}
+
+// ── Softmax ───────────────────────────────────────────────────────────────────
+
+/// In-place softmax with SIMD exp and sum.
+pub fn softmax_f32(xs: &mut [f32]) {
+    let max = hmax_f32(xs)
+
+    // xs[i] = exp(xs[i] - max)
+    comptime if std::target::has_avx2() {
+        let max_v: vec8<f32> = vec8(max)
+        let chunks = xs.len() / 8
+        for i in 0..chunks {
+            let v: vec8<f32> = vec8::load_unaligned(&xs[i * 8])
+            let shifted = v - max_v
+            let exp_v   = shifted.exp()
+            exp_v.store_unaligned(&mut xs[i * 8])
+        }
+        for i in chunks * 8 .. xs.len() {
+            xs[i] = (xs[i] - max).exp()
+        }
+    } else {
+        for x in xs.iter_mut() { x = (x - max).exp() }
+    }
+
+    let sum = hsum_f32(xs)
+    if sum > 0.0 {
+        let inv = 1.0 / sum
+        comptime if std::target::has_avx2() {
+            let inv_v: vec8<f32> = vec8(inv)
+            let chunks = xs.len() / 8
+            for i in 0..chunks {
+                let v: vec8<f32> = vec8::load_unaligned(&xs[i * 8])
+                (v * inv_v).store_unaligned(&mut xs[i * 8])
+            }
+            for i in chunks * 8 .. xs.len() { xs[i] *= inv }
+        } else {
+            for x in xs.iter_mut() { x *= inv }
+        }
+    }
+}
+
+// ── Dot product ───────────────────────────────────────────────────────────────
+
+/// Dot product of two f32 slices.
+pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    assert a.len() == b.len()
+    comptime if std::target::has_avx2() {
+        let mut acc: vec8<f32> = vec8(0.0)
+        let chunks = a.len() / 8
+        for i in 0..chunks {
+            let va: vec8<f32> = vec8::load_unaligned(&a[i * 8])
+            let vb: vec8<f32> = vec8::load_unaligned(&b[i * 8])
+            acc = acc + va * vb
+        }
+        var sum = acc.hadd()
+        for i in chunks * 8 .. a.len() { sum += a[i] * b[i] }
+        sum
+    } else {
+        a.iter().zip(b.iter()).map(fn((&x, &y)) x * y).sum()
+    }
+}
+
+// ── argmax ────────────────────────────────────────────────────────────────────
+
+/// Index of the maximum element in a f32 slice.
+pub fn argmax_f32(xs: &[f32]) -> usize {
+    var best_i: usize = 0
+    var best_v: f32   = f32::NEG_INFINITY
+    for (i, &v) in xs.iter().enumerate() {
+        if v > best_v { best_v = v; best_i = i }
+    }
+    best_i
+}
+
+// ── BF16 ↔ F32 conversion ────────────────────────────────────────────────────
+
+pure fn bf16_to_f32(x: u16) -> f32 {
+    f32::from_bits((x as u32) << 16)
+}
+
+pure fn f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits()
+    // Round to nearest, ties to even
+    let round = (bits >> 16) & 1
+    ((bits + 0x7FFF + round) >> 16) as u16
+}
+
+/// Batch convert BF16 slice → F32 slice (SIMD accelerated on AVX2+).
+pub fn bf16_to_f32_batch(src: &[u16], dst: &mut [f32]) {
+    assert src.len() == dst.len()
+    comptime if std::target::has_avx2() {
+        let chunks = src.len() / 8
+        for i in 0..chunks {
+            let packed: vec8<u32> = vec8::from_slice_as(&src[i * 8])
+            let shifted = packed << vec8(16u32)
+            (shifted as vec8<f32>).store_unaligned(&mut dst[i * 8])
+        }
+        for i in chunks * 8 .. src.len() {
+            dst[i] = bf16_to_f32(src[i])
+        }
+    } else {
+        for (s, d) in src.iter().zip(dst.iter_mut()) {
+            d = bf16_to_f32(s)
+        }
+    }
+}

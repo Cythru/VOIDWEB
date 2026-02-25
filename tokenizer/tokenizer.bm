@@ -1,0 +1,185 @@
+//! VOIDWEB — Memory-mapped BPE tokenizer
+//!
+//! Supports HuggingFace tokenizer.json (Llama, Qwen, Mistral, etc.).
+//!
+//! Hot paths:
+//!   - Vocabulary lookup: HashMap for O(1) amortised encode
+//!   - Batch encode: parallel over prompt list via async scope
+//!   - Decode: simple reverse-lookup
+
+use std::io
+use std::fs
+use std::json
+use std::collections::HashMap
+
+// ── Serialisation helpers (tokenizer.json subset) ─────────────────────────────
+
+struct TokenizerJson {
+    model:        BpeModel,
+    added_tokens: Vec<AddedToken>,
+}
+
+struct BpeModel {
+    vocab:  HashMap<str, u32>,
+    merges: Vec<str>,
+}
+
+struct AddedToken {
+    id:      u32,
+    content: str,
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+pub struct Tokenizer {
+    vocab:          HashMap<Vec<u8>, u32>,   // bytes → token id
+    vocab_rev:      Vec<Vec<u8>>,            // token id → bytes
+    merges:         Vec<(u32, u32, u32)>,    // (left, right, merged)
+    pub vocab_size: usize,
+    unk_id:         u32,
+    bos_id:         u32,
+    eos_id:         u32,
+}
+
+impl Tokenizer {
+    /// Load from a HuggingFace tokenizer.json (memory-mapped).
+    pub fn load(path: str) -> Result<Tokenizer, str> !IO {
+        let data = fs::mmap_file(path)?
+        let tj: TokenizerJson = json::from_bytes(data.as_slice())?
+
+        let vocab_size = tj.model.vocab.len() + tj.added_tokens.len()
+
+        // Build byte → id lookup.
+        let mut vocab: HashMap<Vec<u8>, u32> = HashMap::new()
+        for (tok, id) in &tj.model.vocab {
+            vocab.insert(decode_hf_token(tok), id)
+        }
+        for at in &tj.added_tokens {
+            vocab.insert(at.content.as_bytes(), at.id)
+        }
+
+        // Build id → bytes reverse lookup.
+        let mut vocab_rev: Vec<Vec<u8>> = Vec::with_len(vocab_size, vec![0u8])
+        for (bytes, &id) in &vocab {
+            if id as usize < vocab_size {
+                vocab_rev[id as usize] = bytes.clone()
+            }
+        }
+
+        // Parse merges: "left right" → (left_id, right_id, merged_id)
+        let mut merges: Vec<(u32, u32, u32)> = Vec::new()
+        for m in &tj.model.merges {
+            let parts = m.splitn(2, ' ')
+            let l = parts[0]
+            let r = parts[1]
+            if let (.Some(&lid), .Some(&rid)) = (vocab.get(l.as_bytes()), vocab.get(r.as_bytes())) {
+                let merged_bytes = [l.as_bytes(), r.as_bytes()].concat()
+                if let .Some(&mid) = vocab.get(&merged_bytes) {
+                    merges.push((lid, rid, mid))
+                }
+            }
+        }
+
+        // Determine special token IDs.
+        let unk_id = vocab.get(b"<unk>").copied().unwrap_or(0)
+        let bos_id = vocab.get(b"<s>")
+            .or_else(fn() vocab.get(b"<|begin_of_text|>"))
+            .copied().unwrap_or(1)
+        let eos_id = vocab.get(b"</s>")
+            .or_else(fn() vocab.get(b"<|end_of_text|>"))
+            .copied().unwrap_or(2)
+
+        Ok(Tokenizer { vocab, vocab_rev, merges, vocab_size, unk_id, bos_id, eos_id })
+    }
+
+    /// Encode a single string → token IDs.
+    pub fn encode(self: &Tokenizer, text: str, add_bos: bool) -> Vec<u32> {
+        let mut ids: Vec<u32> = if add_bos { vec![self.bos_id] } else { Vec::new() }
+        ids.extend(self.bpe_encode(text.as_bytes()))
+        ids
+    }
+
+    /// Batch-encode a slice of strings in parallel.
+    pub fn encode_batch(self: &Tokenizer, texts: &[str], add_bos: bool) -> Vec<Vec<u32>> !Spawn {
+        let mut results: Vec<Vec<u32>> = Vec::with_len(texts.len(), Vec::new())
+        async scope {
+            for (i, text) in texts.iter().enumerate() {
+                let tok = self
+                spawn {
+                    results[i] = tok.encode(text, add_bos)
+                }
+            }
+        }
+        results
+    }
+
+    /// Decode token IDs → UTF-8 string (best-effort).
+    pub fn decode(self: &Tokenizer, ids: &[u32]) -> str {
+        let mut bytes: Vec<u8> = Vec::new()
+        for &id in ids {
+            if id as usize < self.vocab_rev.len() {
+                bytes.extend_from_slice(&self.vocab_rev[id as usize])
+            }
+        }
+        str::from_utf8_lossy(&bytes)
+    }
+
+    pub fn bos_id(self: &Tokenizer) -> u32 { self.bos_id }
+    pub fn eos_id(self: &Tokenizer) -> u32 { self.eos_id }
+
+    // ── BPE encode ─────────────────────────────────────────────────────────────
+
+    fn bpe_encode(self: &Tokenizer, bytes: &[u8]) -> Vec<u32> {
+        if bytes.is_empty() { return Vec::new() }
+
+        // Initialise with byte-level tokens.
+        var symbols: Vec<u32> = bytes.iter()
+            .map(fn(&b) self.vocab.get(&[b]).copied().unwrap_or(self.unk_id))
+            .collect()
+
+        // Apply merges in priority order.
+        loop {
+            var best: ?(usize, u32) = .None
+
+            for i in 0 .. symbols.len().saturating_sub(1) {
+                for (pri, &(l, r, _m)) in self.merges.iter().enumerate() {
+                    if symbols[i] == l and symbols[i+1] == r {
+                        match best {
+                            .None          => best = .Some((i, pri as u32)),
+                            .Some((_, bp)) => if (pri as u32) < bp { best = .Some((i, pri as u32)) }
+                        }
+                        break
+                    }
+                }
+            }
+
+            let .Some((pos, pri)) = best else { break }
+            let (_, _, merged) = self.merges[pri as usize]
+            symbols[pos] = merged
+            symbols.remove(pos + 1)
+        }
+
+        symbols
+    }
+}
+
+// ── HuggingFace token byte decoding ───────────────────────────────────────────
+
+/// HF tokenizer.json stores tokens with special Ġ/Ċ escapes.
+pure fn decode_hf_token(tok: str) -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::new()
+    for ch in tok.chars() {
+        match ch {
+            'Ġ' => bytes.push(b' '),
+            'Ċ' => bytes.push(b'\n'),
+            'ĉ' => bytes.push(b'\t'),
+            c if (c as u32) < 256 => bytes.push(c as u8),
+            c => {
+                let mut buf = [0u8; 4]
+                let s = c.encode_utf8(&mut buf)
+                bytes.extend_from_slice(s.as_bytes())
+            }
+        }
+    }
+    bytes
+}
