@@ -1,0 +1,83 @@
+//! VOIDWEB — Rotary Position Embedding (RoPE) kernel
+//!
+//! Applies RoPE in-place to Q and K tensors as described in
+//! "RoFormer: Enhanced Transformer with Rotary Position Embedding" (Su et al. 2021).
+//!
+//! For each (token_pos, head_dim_pair) we rotate a 2D subspace by θ_i·pos
+//! where θ_i = theta^(-2i/d) and d = head_dim.
+//!
+//! SIMD: processes two f16 values at a time (real + imaginary pair).
+
+use std::gpu
+use std::math
+
+// ── RoPE kernel ───────────────────────────────────────────────────────────────
+
+/// Apply RoPE in-place to Q or K.
+///
+/// x:       [batch, seq_len, num_heads, head_dim]  — modified in place
+/// pos_ids: [batch, seq_len]  — absolute token positions
+/// theta:   rope_theta (default 10000.0)
+#[kernel(threads = [64, 1, 1])]
+fn rope_apply(
+    x:       &mut tensor<f16, [BATCH, SEQ_LEN, NUM_HEADS, HEAD_DIM]> @global,
+    pos_ids: &tensor<u32, [BATCH, SEQ_LEN]>                          @global,
+    theta:   f32,
+) {
+    let idx   = @block.x * 64 + @thread.x
+    let total = BATCH * SEQ_LEN * NUM_HEADS * (HEAD_DIM / 2)
+    if idx >= total { return }
+
+    // Decode flat index → (batch, seq, head, half_dim)
+    let half_dim   = HEAD_DIM / 2
+    let head_idx   = (idx / half_dim) % NUM_HEADS
+    let seq_idx    = (idx / (half_dim * NUM_HEADS)) % SEQ_LEN
+    let batch_idx  = idx / (half_dim * NUM_HEADS * SEQ_LEN)
+    let d          = idx % half_dim
+
+    // θ_d = theta^(-2d / head_dim)
+    let freq = 1.0 / theta.powf(2.0 * d as f32 / HEAD_DIM as f32)
+    let pos  = pos_ids[batch_idx, seq_idx] as f32
+    let angle = freq * pos
+
+    let (sin_a, cos_a) = angle.sin_cos()
+
+    // Fetch the pair (x_real, x_imag) = (x[..d], x[..d + half_dim])
+    let x_r: f32 = x[batch_idx, seq_idx, head_idx, d]           as f32
+    let x_i: f32 = x[batch_idx, seq_idx, head_idx, d + half_dim] as f32
+
+    // Rotate: [x_r', x_i'] = [x_r·cos - x_i·sin, x_r·sin + x_i·cos]
+    x[batch_idx, seq_idx, head_idx, d]            = (x_r * cos_a - x_i * sin_a) as f16
+    x[batch_idx, seq_idx, head_idx, d + half_dim] = (x_r * sin_a + x_i * cos_a) as f16
+}
+
+// ── Comptime frequency table ──────────────────────────────────────────────────
+//
+// Pre-compute cos/sin tables at comptime for a fixed head_dim and theta.
+// Avoids recomputing powf in the hot path when theta and head_dim are known.
+
+comptime fn build_rope_table(head_dim: usize, theta: f64, max_seq: usize) -> tensor<f32, [2, max_seq, head_dim / 2]> {
+    let mut table: tensor<f32, [2, max_seq, head_dim / 2]> = tensor::zeros()
+    for pos in 0..max_seq {
+        for d in 0..head_dim / 2 {
+            let freq  = 1.0 / theta.powf(2.0 * d as f64 / head_dim as f64) as f32
+            let angle = freq * pos as f32
+            table[0, pos, d] = angle.cos()
+            table[1, pos, d] = angle.sin()
+        }
+    }
+    table
+}
+
+// ── Host dispatch ──────────────────────────────────────────────────────────────
+
+/// Apply RoPE to a query or key tensor in-place.
+pub fn launch_rope(
+    x:       &mut tensor<f16, [BATCH, SEQ_LEN, NUM_HEADS, HEAD_DIM]> @device,
+    pos_ids: &tensor<u32, [BATCH, SEQ_LEN]>                          @device,
+    theta:   f32,
+) !IO {
+    let total  = BATCH * SEQ_LEN * NUM_HEADS * (HEAD_DIM / 2)
+    let blocks = (total + 63) / 64
+    rope_apply.launch([blocks, 1, 1], x, pos_ids, theta)
+}

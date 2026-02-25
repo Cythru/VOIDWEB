@@ -1,0 +1,300 @@
+//! VOIDWEB HTTP Server
+//!
+//! OpenAI-compatible /v1/chat/completions endpoint with SSE streaming.
+//! Zero Python. Zero GIL.
+//!
+//! Endpoints:
+//!   POST /v1/chat/completions   — chat inference (stream or non-stream)
+//!   GET  /v1/models             — list loaded models
+//!   GET  /health                — liveness probe
+//!   GET  /metrics               — Prometheus metrics
+
+use std::io
+use std::net
+use std::json
+use std::time
+use std::env
+
+use engine::engine::{Engine, ModelConfig}
+use scheduler::{SamplingParams, RequestId}
+use quantization::detect_quant_scheme
+use metrics::metrics
+
+// ── Effects used by the server ────────────────────────────────────────────────
+
+effect Http {
+    fn listen(addr: str, handler: fn(HttpRequest) -> HttpResponse !IO) -> never !IO
+    fn sse_stream(req: HttpRequest) -> SseWriter !IO
+}
+
+// ── OpenAI-compatible types ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct ChatRequest {
+    model:       ?str,
+    messages:    Vec<ChatMessage>,
+    max_tokens:  ?u32,
+    temperature: ?f32,
+    top_p:       ?f32,
+    top_k:       ?u32,
+    stream:      ?bool,
+    stop:        Vec<str>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatMessage {
+    role:    str,
+    content: str,
+}
+
+#[derive(Debug, Clone)]
+struct ChatResponse {
+    id:      str,
+    object:  str,
+    created: u64,
+    model:   str,
+    choices: Vec<Choice>,
+    usage:   Usage,
+}
+
+#[derive(Debug, Clone)]
+struct Choice {
+    index:         u32,
+    message:       ChatMessage,
+    finish_reason: str,
+}
+
+#[derive(Debug, Clone)]
+struct StreamChunk {
+    id:      str,
+    object:  str,
+    created: u64,
+    model:   str,
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamChoice {
+    index:         u32,
+    delta:         StreamDelta,
+    finish_reason: ?str,
+}
+
+#[derive(Debug, Clone)]
+struct StreamDelta {
+    role:    ?str,
+    content: ?str,
+}
+
+#[derive(Debug, Clone)]
+struct Usage {
+    prompt_tokens:     u32,
+    completion_tokens: u32,
+    total_tokens:      u32,
+}
+
+// ── App state (shared across all request handlers) ─────────────────────────────
+
+struct AppState {
+    engine:   Engine,
+    model_id: str,
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() -> void !IO + Log + Spawn + Fail<str> {
+    let args = env::args()
+    let model_path  = args.get(1).unwrap_or("/models/default")
+    let kernel_lib  = args.get(2).unwrap_or("./libkernels.so")
+    let host        = args.get(3).unwrap_or("0.0.0.0")
+    let port: u16   = args.get(4).and_then(fn(p) p.parse().ok()).unwrap_or(8000)
+
+    Log::log(.Info, "VOIDWEB inference server starting — model={model_path} kernel_lib={kernel_lib}")
+
+    // Load model config from model directory.
+    let config_json_str = std::fs::read_to_string("{model_path}/config.json")
+        .unwrap_or("{}")
+    let config_val: json::Value = json::from_str(config_json_str)?
+
+    let quant    = detect_quant_scheme(&config_val)
+    let model_id = config_val["model_type"].as_str().unwrap_or("voidweb").to_owned()
+
+    let cfg = ModelConfig {
+        model_type:     model_id.clone(),
+        hidden_size:    config_val["hidden_size"].as_u64().unwrap_or(4096) as usize,
+        num_heads:      config_val["num_attention_heads"].as_u64().unwrap_or(32) as usize,
+        num_kv_heads:   config_val["num_key_value_heads"].as_u64().unwrap_or(8) as usize,
+        num_layers:     config_val["num_hidden_layers"].as_u64().unwrap_or(32) as usize,
+        vocab_size:     config_val["vocab_size"].as_u64().unwrap_or(32000) as usize,
+        max_seq_len:    config_val["max_position_embeddings"].as_u64().unwrap_or(8192) as usize,
+        rope_theta:     config_val["rope_theta"].as_f64().unwrap_or(10000.0) as f32,
+        rms_norm_eps:   config_val["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
+        quant_scheme:   quant,
+        weights_path:   model_path.to_owned(),
+        tokenizer_path: .None,
+    }
+
+    let mut engine = Engine::load(cfg, kernel_lib)?
+    let state = AppState { engine, model_id: model_id.clone() }
+
+    // Spawn the continuous-batching inference loop.
+    spawn {
+        loop {
+            match state.engine.step() {
+                Ok(toks) if toks.is_empty() => {
+                    std::time::sleep_micros(100)
+                }
+                Ok(_) => {}
+                Err(e) => Log::log(.Warn, "Engine step error: {e}"),
+            }
+        }
+    }
+
+    let addr = "{host}:{port}"
+    Log::log(.Info, "Listening on http://{addr}")
+
+    net::http::serve(addr, fn(req: net::http::Request) -> net::http::Response !IO + Log {
+        match (req.method, req.path) {
+            ("POST", "/v1/chat/completions") => handle_chat(&state, req),
+            ("GET",  "/v1/models")           => handle_models(&state),
+            ("GET",  "/health")              => net::http::Response::ok("ok"),
+            ("GET",  "/metrics")             => net::http::Response::ok(metrics::prometheus_text()),
+            _                               => net::http::Response::not_found("not found"),
+        }
+    })
+}
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+fn handle_models(state: &AppState) -> net::http::Response !IO {
+    let body = json::to_str(json::object([
+        ("object", json::str("list")),
+        ("data", json::array([json::object([
+            ("id",       json::str(state.model_id)),
+            ("object",   json::str("model")),
+            ("created",  json::u64(unix_now())),
+            ("owned_by", json::str("voidweb")),
+        ])])),
+    ]))
+    net::http::Response::json(body)
+}
+
+fn handle_chat(state: &AppState, req: net::http::Request) -> net::http::Response !IO + Log {
+    let chat_req: ChatRequest = json::from_str(req.body)?
+
+    let stream = chat_req.stream.unwrap_or(false)
+    let params = SamplingParams {
+        temperature:        chat_req.temperature.unwrap_or(0.7),
+        top_p:              chat_req.top_p.unwrap_or(0.95),
+        top_k:              chat_req.top_k.unwrap_or(50),
+        max_new_tokens:     chat_req.max_tokens.unwrap_or(2048),
+        repetition_penalty: 1.1,
+        stop_tokens:        Vec::new(),
+    }
+
+    let prompt       = build_prompt(&chat_req.messages)
+    let prompt_tokens = state.engine.tokenizer.encode(prompt, true)
+    let prompt_len    = prompt_tokens.len() as u32
+
+    let req_id = state.engine.scheduler.add_request(prompt_tokens, params)
+
+    if stream {
+        stream_response(state, req_id, state.model_id.clone(), prompt_len)
+    } else {
+        let output = wait_for_completion(state, req_id)
+        let completion_tokens = output.len() as u32
+        let text = state.engine.tokenizer.decode(&output)
+        let resp = ChatResponse {
+            id:      "chatcmpl-{req_id}",
+            object:  "chat.completion",
+            created: unix_now(),
+            model:   state.model_id.clone(),
+            choices: vec![Choice {
+                index:         0,
+                message:       ChatMessage { role: "assistant", content: text },
+                finish_reason: "stop",
+            }],
+            usage: Usage {
+                prompt_tokens:     prompt_len,
+                completion_tokens,
+                total_tokens:      prompt_len + completion_tokens,
+            },
+        }
+        net::http::Response::json(json::to_str(resp))
+    }
+}
+
+// ── SSE streaming ─────────────────────────────────────────────────────────────
+
+fn stream_response(
+    state:      &AppState,
+    req_id:     RequestId,
+    model_id:   str,
+    prompt_len: u32,
+) -> net::http::Response !IO {
+    net::http::Response::sse(fn(writer: &mut net::http::SseWriter) !IO {
+        // First chunk: role delta.
+        let first = StreamChunk {
+            id:      "chatcmpl-{req_id}",
+            object:  "chat.completion.chunk",
+            created: unix_now(),
+            model:   model_id.clone(),
+            choices: vec![StreamChoice {
+                index:         0,
+                delta:         StreamDelta { role: .Some("assistant"), content: .None },
+                finish_reason: .None,
+            }],
+        }
+        writer.send(json::to_str(first))
+
+        // Poll for completion.
+        loop {
+            std::time::sleep_micros(200)
+
+            let finished_list = state.engine.scheduler.drain_finished()
+            let found = finished_list.into_iter().find(fn((id, _)) id == req_id)
+
+            if let .Some((_, toks)) = found {
+                let text  = state.engine.tokenizer.decode(&toks)
+                let chunk = StreamChunk {
+                    id:      "chatcmpl-{req_id}",
+                    object:  "chat.completion.chunk",
+                    created: unix_now(),
+                    model:   model_id.clone(),
+                    choices: vec![StreamChoice {
+                        index:         0,
+                        delta:         StreamDelta { role: .None, content: .Some(text) },
+                        finish_reason: .Some("stop"),
+                    }],
+                }
+                writer.send(json::to_str(chunk))
+                writer.send("[DONE]")
+                break
+            }
+        }
+    })
+}
+
+fn wait_for_completion(state: &AppState, req_id: RequestId) -> Vec<u32> !IO {
+    loop {
+        std::time::sleep_millis(5)
+        let list  = state.engine.scheduler.drain_finished()
+        let found = list.into_iter().find(fn((id, _)) id == req_id)
+        if let .Some((_, toks)) = found { return toks }
+    }
+}
+
+// ── Prompt builder ────────────────────────────────────────────────────────────
+
+/// ChatML format (Llama 3, Qwen, etc.)
+pure fn build_prompt(messages: &[ChatMessage]) -> str {
+    var s: str = ""
+    for msg in messages {
+        s = "{s}<|im_start|>{msg.role}\n{msg.content}<|im_end|>\n"
+    }
+    "{s}<|im_start|>assistant\n"
+}
+
+pure fn unix_now() -> u64 {
+    time::now_secs()
+}

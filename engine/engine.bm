@@ -1,0 +1,178 @@
+//! VOIDWEB Inference Engine
+//!
+//! Core orchestrator: loads weights, runs the forward pass, owns the KV cache.
+//! GPU kernels are invoked via BLACK MAGIC #[kernel] dispatch.
+//! No Python. No GIL. No mercy.
+
+use std::io
+use std::fs
+use std::path
+use std::collections::HashMap
+use std::sync
+
+use engine::kv_cache::{BlockManager, BlockId, KvPage}
+use engine::ffi::KernelLib
+use scheduler::{Scheduler, Request, RequestId, BatchView}
+use tokenizer::Tokenizer
+use sampler::{Sampler, SamplerConfig}
+use quantization::QuantScheme
+
+// ── Model configuration ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ModelConfig {
+    pub model_type:     str,
+    pub hidden_size:    usize,
+    pub num_heads:      usize,
+    pub num_kv_heads:   usize,
+    pub num_layers:     usize,
+    pub vocab_size:     usize,
+    pub max_seq_len:    usize,
+    pub rope_theta:     f32,
+    pub rms_norm_eps:   f32,
+    pub quant_scheme:   QuantScheme,
+    pub weights_path:   str,
+    pub tokenizer_path: ?str,
+}
+
+impl ModelConfig {
+    pub fn head_dim(self: &ModelConfig) -> usize {
+        self.hidden_size / self.num_heads
+    }
+}
+
+// ── Weight slab (memory-mapped, linear — must be explicitly closed) ───────────
+
+linear struct WeightSlab {
+    ptr:  *const u8,
+    len:  usize,
+    path: str,
+}
+
+impl WeightSlab {
+    pub fn open(path: str) -> Result<WeightSlab, str> !IO {
+        let fd    = fs::mmap_file(path)?
+        let (ptr, len) = fd.as_bytes()
+        Ok(WeightSlab { ptr, len, path })
+    }
+
+    pub fn close(self) -> void !IO {
+        fs::munmap(self.ptr, self.len)
+    }
+
+    pub fn as_slice(self: &WeightSlab) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+// ── Engine ────────────────────────────────────────────────────────────────────
+
+pub struct Engine {
+    pub config:     ModelConfig,
+    weight_slabs:   Vec<WeightSlab>,
+    pub block_mgr:  BlockManager,
+    kernels:        KernelLib,
+    pub scheduler:  Scheduler,
+    pub tokenizer:  Tokenizer,
+    pub sampler:    Sampler,
+}
+
+impl Engine {
+    /// Load model from disk and initialise all subsystems.
+    pub fn load(cfg: ModelConfig, kernel_lib_path: str) -> Result<Engine, str> !IO + Log {
+        Log::log(.Info, "Loading VOIDWEB engine — model={cfg.model_type} quant={cfg.quant_scheme:?}")
+
+        // ── Load kernel library ───────────────────────────────────────────────
+        let kernels = KernelLib::open(kernel_lib_path)?
+        Log::log(.Info, "Kernel library loaded from {kernel_lib_path}")
+
+        // ── Memory-map weight files ───────────────────────────────────────────
+        let weight_slabs = Self::mmap_weights(cfg.weights_path)?
+        Log::log(.Info, "Mapped {weight_slabs.len()} weight shard(s)")
+
+        // ── Block manager (paged KV cache) ────────────────────────────────────
+        let block_mgr = BlockManager::new(
+            cfg.num_layers,
+            cfg.num_kv_heads,
+            cfg.head_dim(),
+            /* block_size_tokens */ 16,
+            /* max_gpu_blocks    */ Self::estimate_gpu_blocks(&cfg),
+        )
+
+        // ── Tokenizer ─────────────────────────────────────────────────────────
+        let tok_path = cfg.tokenizer_path
+            .unwrap_or("{cfg.weights_path}/tokenizer.json")
+        let tokenizer = Tokenizer::load(tok_path)?
+        Log::log(.Info, "Tokenizer loaded — vocab_size={tokenizer.vocab_size}")
+
+        // ── Scheduler ─────────────────────────────────────────────────────────
+        let scheduler = Scheduler::new(
+            cfg.max_seq_len,
+            /* max_batch_tokens */ 8192,
+            /* max_running_seqs */ 256,
+        )
+
+        // ── Sampler ───────────────────────────────────────────────────────────
+        let sampler = Sampler::new(SamplerConfig::default())
+
+        Ok(Engine { config: cfg, weight_slabs, block_mgr, kernels, scheduler, tokenizer, sampler })
+    }
+
+    /// Run one decode step for the current running batch.
+    /// Returns Vec<(RequestId, u32)> — (request, next_token) pairs.
+    pub fn step(self: &mut Engine) -> Result<Vec<(RequestId, u32)>, str> !Log {
+        let batch = self.scheduler.schedule_batch()
+
+        if batch.is_empty() {
+            return Ok(vec![])
+        }
+
+        Log::log(.Debug, "step: batch_size={batch.num_seqs()} total_tokens={batch.total_tokens()}")
+
+        // Build GPU input tensors and invoke forward pass.
+        let logits = self.kernels.forward_pass(&self.config, &batch, &self.block_mgr)?
+
+        // Sample next token for each sequence.
+        let next_tokens = self.sampler.sample_batch(&logits, &batch)?
+
+        // Update scheduler (append tokens, free finished requests).
+        self.scheduler.commit_step(&next_tokens)?
+
+        Ok(next_tokens)
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    fn mmap_weights(dir: str) -> Result<Vec<WeightSlab>, str> !IO {
+        let mut slabs: Vec<WeightSlab> = Vec::new()
+
+        for ext in ["safetensors", "gguf", "bin"] {
+            for entry in fs::read_dir(dir)? {
+                let p = entry.path()
+                if p.extension() == ext {
+                    slabs.push(WeightSlab::open(p)?)
+                }
+            }
+            if not slabs.is_empty() { break }
+        }
+
+        if slabs.is_empty() {
+            return Err("No weight files found in {dir}")
+        }
+        Ok(slabs)
+    }
+
+    fn estimate_gpu_blocks(cfg: &ModelConfig) -> usize {
+        // Heuristic: assume 80% of an 80 GB A100 is free for KV cache.
+        // Each block = block_size * num_layers * 2 (K+V) * num_kv_heads * head_dim * 2 bytes (bf16).
+        let block_size_tokens: usize = 16
+        let bytes_per_block = block_size_tokens
+            * cfg.num_layers
+            * 2
+            * cfg.num_kv_heads
+            * cfg.head_dim()
+            * 2  // bf16
+        let available_bytes: usize = 80 * 1024 * 1024 * 1024 * 8 / 10  // 80% of 80 GB
+        (available_bytes / bytes_per_block).max(512)
+    }
+}

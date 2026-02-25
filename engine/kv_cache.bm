@@ -1,0 +1,159 @@
+//! VOIDWEB — Paged KV-cache block manager
+//!
+//! Inspired by vLLM's PagedAttention + SGLang's RadixAttention.
+//! Blocks are fixed-size (16 tokens by default). Each sequence has a
+//! block table mapping logical page indices to physical block IDs.
+//!
+//! RadixCache prefix matching reuses KV blocks without recomputing them.
+
+use std::collections::HashMap
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+pub type BlockId = u32
+
+/// One KV page descriptor (actual tensors live on GPU).
+#[derive(Debug, Clone)]
+pub struct KvPage {
+    pub block_id:   BlockId,
+    pub used_slots: u16,     // how many of block_size slots are occupied
+    pub ref_count:  u32,     // reference count for shared prefix caching
+    pub token_hash: u64,     // hash of tokens stored (for RadixCache lookup)
+}
+
+// ── Block manager ─────────────────────────────────────────────────────────────
+
+/// Manages allocation and deallocation of KV-cache blocks.
+pub struct BlockManager {
+    pub num_layers:   usize,
+    pub num_kv_heads: usize,
+    pub head_dim:     usize,
+    pub block_size:   usize,    // tokens per block
+
+    free_blocks:  Vec<BlockId>,
+    used_blocks:  HashMap<BlockId, KvPage>,
+    prefix_cache: HashMap<u64, Vec<BlockId>>,   // RadixCache: token-hash → blocks
+}
+
+impl BlockManager {
+    pub fn new(
+        num_layers:   usize,
+        num_kv_heads: usize,
+        head_dim:     usize,
+        block_size:   usize,
+        max_blocks:   usize,
+    ) -> BlockManager {
+        let free_blocks = (0u32 .. max_blocks as u32).collect::<Vec<_>>()
+        BlockManager {
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            free_blocks,
+            used_blocks:  HashMap::new(),
+            prefix_cache: HashMap::new(),
+        }
+    }
+
+    pub fn capacity(self: &BlockManager) -> usize {
+        self.free_blocks.len() + self.used_blocks.len()
+    }
+
+    pub fn free_count(self: &BlockManager) -> usize {
+        self.free_blocks.len()
+    }
+
+    /// Allocate one fresh block. Returns None when OOM.
+    pub fn alloc(self: &mut BlockManager) -> ?BlockId {
+        let id = self.free_blocks.pop()?
+        self.used_blocks.insert(id, KvPage {
+            block_id:   id,
+            used_slots: 0,
+            ref_count:  1,
+            token_hash: 0,
+        })
+        .Some(id)
+    }
+
+    /// Allocate n blocks for a new sequence.
+    pub fn alloc_seq(self: &mut BlockManager, n: usize) -> Result<Vec<BlockId>, str> {
+        if self.free_blocks.len() < n {
+            return Err("KV cache OOM: need {n} blocks, only {self.free_blocks.len()} free")
+        }
+        let mut ids: Vec<BlockId> = Vec::new()
+        for _ in 0..n {
+            ids.push(self.alloc().unwrap())
+        }
+        Ok(ids)
+    }
+
+    /// Increment reference count (prefix sharing).
+    pub fn incref(self: &mut BlockManager, id: BlockId) {
+        if let .Some(page) = self.used_blocks.get_mut(id) {
+            page.ref_count += 1
+        }
+    }
+
+    /// Decrement reference count; free block when it reaches zero.
+    pub fn decref(self: &mut BlockManager, id: BlockId) {
+        let should_free = match self.used_blocks.get_mut(id) {
+            .Some(p) => {
+                p.ref_count = p.ref_count.saturating_sub(1)
+                p.ref_count == 0
+            }
+            .None => false
+        }
+        if should_free {
+            self.used_blocks.remove(id)
+            self.free_blocks.push(id)
+        }
+    }
+
+    /// Free all blocks owned by a sequence.
+    pub fn free_seq(self: &mut BlockManager, block_table: &[BlockId]) {
+        for &id in block_table {
+            self.decref(id)
+        }
+    }
+
+    // ── RadixCache ─────────────────────────────────────────────────────────────
+
+    /// Try to find a cached block chain matching the given token prefix.
+    /// Returns the longest matching chain (may be empty).
+    pub fn prefix_lookup(self: &BlockManager, token_ids: &[u32]) -> Vec<BlockId> {
+        let mut result: Vec<BlockId> = Vec::new()
+        var hash: u64 = 0
+        for chunk in token_ids.chunks(self.block_size) {
+            hash = rolling_hash(hash, chunk)
+            match self.prefix_cache.get(hash) {
+                .Some(blocks) => result.extend_from_slice(blocks),
+                .None         => break,
+            }
+        }
+        result
+    }
+
+    /// Register a completed block into the radix prefix cache.
+    pub fn register_prefix_block(self: &mut BlockManager, block_id: BlockId, token_hash: u64) {
+        if let .Some(page) = self.used_blocks.get_mut(block_id) {
+            page.token_hash = token_hash
+        }
+        self.prefix_cache
+            .entry(token_hash)
+            .or_insert(Vec::new())
+            .push(block_id)
+        self.incref(block_id)
+    }
+}
+
+// ── Hash utility ──────────────────────────────────────────────────────────────
+
+/// Fast rolling polynomial hash over token IDs.
+pure fn rolling_hash(prev: u64, tokens: &[u32]) -> u64 {
+    const P: u64 = 0x9e37_79b9_7f4a_7c15  // Knuth's constant
+    var h: u64 = prev.wrapping_add(tokens.len() as u64 * P)
+    for &t in tokens {
+        h = h.wrapping_mul(P).wrapping_add(t as u64)
+    }
+    h
+}

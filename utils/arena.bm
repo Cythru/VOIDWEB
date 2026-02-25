@@ -1,0 +1,85 @@
+//! VOIDWEB — Arena allocator
+//!
+//! A bump allocator for short-lived per-request allocations.
+//! All memory is freed at once when the arena resets.
+//! Zero fragmentation. O(1) alloc and reset.
+
+use std::alloc
+
+// ── Arena ─────────────────────────────────────────────────────────────────────
+
+/// A fixed-capacity bump allocator backed by a single heap slab.
+/// Allocations are never individually freed — call reset() to reclaim all.
+pub struct Arena {
+    base:   *mut u8,
+    cap:    usize,
+    offset: usize,
+}
+
+impl Arena {
+    /// Create an arena with `capacity` bytes.
+    pub fn new(capacity: usize) -> Arena {
+        let base = std::alloc::heap.alloc_raw(capacity, /* align */ 16)
+        Arena { base, cap: capacity, offset: 0 }
+    }
+
+    /// Allocate `size` bytes aligned to `align`. Returns null on OOM.
+    pub fn alloc_raw(self: &mut Arena, size: usize, align: usize) -> *mut u8 {
+        let aligned = (self.offset + align - 1) & not(align - 1)
+        if aligned + size > self.cap { return null }
+        self.offset = aligned + size
+        unsafe { self.base.add(aligned) }
+    }
+
+    /// Allocate a value of type T. Returns null on OOM.
+    pub fn alloc<T>(self: &mut Arena) -> *mut T {
+        self.alloc_raw(std::mem::size_of::<T>(), std::mem::align_of::<T>()) as *mut T
+    }
+
+    /// Allocate a slice of `n` T values (uninitialized). Returns null on OOM.
+    pub fn alloc_slice<T>(self: &mut Arena, n: usize) -> *mut T {
+        self.alloc_raw(n * std::mem::size_of::<T>(), std::mem::align_of::<T>()) as *mut T
+    }
+
+    /// Reset the arena — all previous allocations become invalid.
+    pub fn reset(self: &mut Arena) {
+        self.offset = 0
+    }
+
+    /// How many bytes are currently allocated.
+    pub fn used(self: &Arena) -> usize {
+        self.offset
+    }
+
+    /// How many bytes remain available.
+    pub fn remaining(self: &Arena) -> usize {
+        self.cap - self.offset
+    }
+
+    /// Free the backing slab (arena must not be used after this).
+    pub fn destroy(self) {
+        unsafe { std::alloc::heap.free_raw(self.base, self.cap, 16) }
+    }
+}
+
+// ── Thread-local arena ────────────────────────────────────────────────────────
+
+/// 4 MB per-thread arena for request-scoped scratch allocations.
+const THREAD_ARENA_SIZE: usize = 4 * 1024 * 1024
+
+thread_local {
+    pub var thread_arena: Arena = Arena::new(THREAD_ARENA_SIZE)
+}
+
+/// Allocate from the current thread's scratch arena.
+pub fn scratch_alloc<T>() -> *mut T {
+    thread_arena.alloc::<T>()
+}
+
+pub fn scratch_alloc_slice<T>(n: usize) -> *mut T {
+    thread_arena.alloc_slice::<T>(n)
+}
+
+pub fn scratch_reset() {
+    thread_arena.reset()
+}

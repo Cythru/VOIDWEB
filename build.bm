@@ -1,0 +1,59 @@
+// VOIDWEB build manifest
+//
+// Build with: bmc build
+// Run with:   bmc run server/main.bm -- /path/to/model ./libkernels.so 0.0.0.0 8000
+
+project {
+    name:    "voidweb",
+    version: "0.2.0",
+    target:  .native,
+}
+
+dependency("std", version: "0.1")
+
+// ── Modules ───────────────────────────────────────────────────────────────────
+
+module("engine",       path: "engine/engine.bm")
+module("kv_cache",     path: "engine/kv_cache.bm")
+module("ffi",          path: "engine/ffi.bm")
+module("scheduler",    path: "scheduler/scheduler.bm")
+module("tokenizer",    path: "tokenizer/tokenizer.bm")
+module("sampler",      path: "sampler/sampler.bm")
+module("quantization", path: "quantization/quantization.bm")
+module("radix_cache",  path: "radix_cache/radix_cache.bm")
+module("loader",       path: "loader/loader.bm")
+module("metrics",      path: "metrics/metrics.bm")
+module("arena",        path: "utils/arena.bm")
+module("ring",         path: "utils/ring.bm")
+module("simd_utils",   path: "utils/simd.bm")
+
+// ── GPU kernels (compiled to PTX / WASM) ─────────────────────────────────────
+
+module("flash_attention", path: "kernels/attention/flash_attention.bm", target: .gpu)
+module("rope",            path: "kernels/rope/rope.bm",                 target: .gpu)
+module("rms_norm",        path: "kernels/norm/rms_norm.bm",             target: .gpu)
+module("gemm_fp8",        path: "kernels/gemm/gemm_fp8.bm",             target: .gpu)
+
+// ── Executables ───────────────────────────────────────────────────────────────
+
+executable("voidweb-server") {
+    main:    "server/main.bm",
+    modules: ["engine", "kv_cache", "ffi", "scheduler", "tokenizer", "sampler",
+              "quantization", "radix_cache", "loader", "metrics",
+              "flash_attention", "rope", "rms_norm", "gemm_fp8",
+              "arena", "ring", "simd_utils"],
+    link:    ["cuda", "cudart"],
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+test_suite("unit") {
+    files:  ["tests/**/*.bm"],
+    filter: .debug,
+}
+
+// ── Benchmark ─────────────────────────────────────────────────────────────────
+
+build_step("bench") {
+    run: "bmc bench bench/bench.bm"
+}
