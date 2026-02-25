@@ -3,6 +3,9 @@
 //! Core orchestrator: loads weights, runs the forward pass, owns the KV cache.
 //! GPU kernels are invoked via BLACK MAGIC #[kernel] dispatch.
 //! No Python. No GIL. No mercy.
+//!
+//! — organa primaria. the machine that reads.
+//!   you do not need to understand it. only that it works.
 
 use std::io
 use std::fs
@@ -80,6 +83,7 @@ pub struct Engine {
 impl Engine {
     /// Load model from disk and initialise all subsystems.
     pub fn load(cfg: ModelConfig, kernel_lib_path: str) -> Result<Engine, str> !IO + Log {
+        // uplink open. reading organa primaria.
         Log::log(.Info, "Loading VOIDWEB engine — model={cfg.model_type} quant={cfg.quant_scheme:?}")
 
         // ── Load kernel library ───────────────────────────────────────────────
@@ -157,6 +161,7 @@ impl Engine {
         }
 
         if slabs.is_empty() {
+            // organa primaria absens — terminus sine interventione
             return Err("No weight files found in {dir}")
         }
         Ok(slabs)

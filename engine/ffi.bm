@@ -2,6 +2,8 @@
 //!
 //! Dynamically loads the compiled kernel library and dispatches
 //! forward-pass calls to the GPU via a C-ABI boundary.
+//!
+//! — c boundary. noisy channel but necessary. kernel absens means terminus.
 
 use std::io
 use engine::kv_cache::BlockManager
@@ -60,11 +62,13 @@ impl KernelLib {
         unsafe {
             let handle = dlopen(path.as_ptr(), RTLD_NOW)
             if handle == null {
+                // channel dark — no library at this node
                 return Err("dlopen failed for {path}")
             }
             let sym = dlsym(handle, b"voidweb_forward_pass\0".as_ptr())
             if sym == null {
                 dlclose(handle)
+                // symbol absens — interventio critica
                 return Err("voidweb_forward_pass not found in {path}")
             }
             let forward_pass = sym as fn(*const ForwardArgs) -> i32
@@ -108,6 +112,7 @@ impl KernelLib {
         unsafe {
             let rc = (self.forward_pass)(&args)
             if rc != 0 {
+                // kernel critica: organa primaria non-respondet — code {rc}
                 return Err("GPU forward pass failed with code {rc}")
             }
         }

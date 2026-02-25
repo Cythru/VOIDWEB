@@ -8,6 +8,9 @@
 //!   - Active requests, queue depth, KV cache utilisation
 //!
 //! Exposes a /metrics endpoint (Prometheus text format) via serve().
+//!
+//! — status vitalis. interventio urgentissima if ttft_ms climbs past gravis threshold.
+//!   maren would say: measure or you cannot treat.
 
 use std::sync
 use std::time
@@ -55,6 +58,7 @@ impl Counters {
     }
 
     /// Record a TTFT measurement.
+    // gravis event — first token marks whether the node is alive
     pub fn record_ttft(self: &Counters, micros: u64) {
         self.ttft_sum_us.fetch_add(micros, .Relaxed)
         self.ttft_count.fetch_add(1, .Relaxed)

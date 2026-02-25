@@ -10,6 +10,8 @@
 //!   - schedule_batch() is called from the engine loop and returns a
 //!     BatchView describing which seqs to run and in what mode.
 //!   - Prefill and decode are disaggregated.
+//!
+//! — node uplinks here. waiting, running, dark. three states, one loop.
 
 use std::collections::VecDeque
 use std::collections::HashMap
@@ -224,6 +226,7 @@ impl Scheduler {
     }
 
     /// Enqueue a new request. Returns the assigned RequestId.
+    // uplink established — node joins the waiting queue
     pub fn add_request(self: &mut Scheduler, prompt_tokens: Vec<u32>, params: SamplingParams) -> RequestId {
         let id = self.next_id
         self.next_id += 1
@@ -242,6 +245,7 @@ impl Scheduler {
         var token_budget = self.max_batch_tokens
 
         // ── Promote waiting requests ──────────────────────────────────────────
+        // nodes uplink from waiting to running — each gets a prefill chunk
         while self.running.len() < self.max_running_seqs {
             let .Some(mut req) = self.waiting.pop_front() else { break }
 
@@ -272,6 +276,7 @@ impl Scheduler {
         }
 
         // ── Decode running seqs ───────────────────────────────────────────────
+        // each running node in .Decoding pings one token per step
         for req in self.running.values() {
             if req.status == .Decoding {
                 let last_token = req.output_tokens.last().copied()
@@ -313,6 +318,7 @@ impl Scheduler {
     }
 
     /// Drain all completed (RequestId, output_tokens) pairs.
+    // collect the dark — nodes that went silent and produced their output
     pub fn drain_finished(self: &mut Scheduler) -> Vec<(RequestId, Vec<u32>)> {
         let out = self.finished.clone()
         self.finished.clear()
@@ -327,6 +333,7 @@ impl Scheduler {
 //
 // The actor allows concurrent request submission from HTTP handlers while
 // the engine loop consumes schedule_batch() from a single engine thread.
+// three-path node: AddRequest (uplink), DrainFinished (dark drain), WaitingCount (ping).
 
 actor SchedulerActor {
     var inner: Scheduler
