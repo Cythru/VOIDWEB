@@ -1,0 +1,265 @@
+// VOIDWEB — Benchmark Chart Renderer
+//
+// Reads bench_results.json and renders terminal bar charts.
+// Outputs:  stdout (coloured terminal report)
+//           bench_report.txt (plain text copy)
+//
+// Build:  g++ -std=c++20 -O2 -o bench_plot plot.cpp
+//
+// Usage:
+//   ./bench_plot                        # reads bench_results.json
+//   ./bench_plot --input my.json
+//   ./bench_plot --metric throughput    # throughput | ttft | itl
+//   ./bench_plot --width 40             # bar width (default 32)
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// ── Minimal JSON reader ───────────────────────────────────────────────────────
+// Hand-rolled — no deps. Handles the flat structure bench.rs emits.
+
+struct Row {
+    std::string engine;
+    double      throughput    = 0;
+    double      ttft_p50_ms   = 0;
+    double      ttft_p95_ms   = 0;
+    double      itl_p50_ms    = 0;
+    double      itl_p95_ms    = 0;
+    double      success_rate  = 0;
+    long        vram_mib      = 0;
+};
+
+static std::string extract_str(const std::string& json, const std::string& key) {
+    auto pos = json.find("\"" + key + "\":\"");
+    if (pos == std::string::npos) return "";
+    pos += key.size() + 4;
+    auto end = json.find('"', pos);
+    return (end == std::string::npos) ? "" : json.substr(pos, end - pos);
+}
+
+static double extract_num(const std::string& json, const std::string& key) {
+    auto pos = json.find("\"" + key + "\":");
+    if (pos == std::string::npos) return 0.0;
+    pos += key.size() + 3;
+    return std::stod(json.substr(pos));
+}
+
+// Parse { "1": { row }, "4": { row }, ... } for one engine block
+static std::map<int, Row> parse_engine_block(const std::string& block, const std::string& eng_key) {
+    std::map<int, Row> out;
+    size_t p = 0;
+    while ((p = block.find('"', p)) != std::string::npos) {
+        // read concurrency key
+        size_t q = block.find('"', p + 1);
+        if (q == std::string::npos) break;
+        std::string conc_s = block.substr(p + 1, q - p - 1);
+        int conc = 0;
+        try { conc = std::stoi(conc_s); } catch (...) { p = q + 1; continue; }
+        // find inner { }
+        size_t brace = block.find('{', q + 1);
+        if (brace == std::string::npos) break;
+        size_t close = block.find('}', brace);
+        if (close == std::string::npos) break;
+        std::string inner = block.substr(brace + 1, close - brace - 1);
+        Row r;
+        r.engine       = extract_str(inner, "engine");
+        r.throughput   = extract_num(inner, "throughput");
+        r.ttft_p50_ms  = extract_num(inner, "ttft_p50_ms");
+        r.ttft_p95_ms  = extract_num(inner, "ttft_p95_ms");
+        r.itl_p50_ms   = extract_num(inner, "itl_p50_ms");
+        r.itl_p95_ms   = extract_num(inner, "itl_p95_ms");
+        r.success_rate = extract_num(inner, "success_rate");
+        r.vram_mib     = static_cast<long>(extract_num(inner, "vram_mib"));
+        out[conc] = r;
+        p = close + 1;
+    }
+    return out;
+}
+
+// ── Colours ───────────────────────────────────────────────────────────────────
+
+static const char* RESET = "\033[0m";
+static const char* BOLD  = "\033[1m";
+static const char* DIM   = "\033[2m";
+static const char* RED   = "\033[91m";
+static const char* GRN   = "\033[92m";
+static const char* YEL   = "\033[93m";
+static const char* BLU   = "\033[94m";
+static const char* MAG   = "\033[95m";
+static const char* CYN   = "\033[96m";
+
+static const char* ENGINE_COLORS[] = { MAG, MAG, BLU, YEL, CYN, GRN };
+static const char* MEDALS[]        = { "[1]", "[2]", "[3]", "   ", "   ", "   " };
+
+static std::string bar(double value, double max_val, int width) {
+    if (max_val <= 0.0) return std::string(width, ' ');
+    int filled = static_cast<int>(std::round(value / max_val * width));
+    filled = std::max(1, std::min(filled, width));
+    return std::string(filled, static_cast<char>(0xE2)) // UTF-8 █ is multi-byte
+         + std::string(width - filled, ' ');
+    // simplified: use ASCII chars for portability
+}
+
+static std::string bar_ascii(double value, double max_val, int width) {
+    if (max_val <= 0.0) return std::string(width, '.');
+    int filled = static_cast<int>(std::round(value / max_val * width));
+    filled = std::max(1, std::min(filled, width));
+    return std::string(filled, '#') + std::string(width - filled, '.');
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+int main(int argc, char** argv) {
+    std::string input_path = "bench_results.json";
+    std::string metric     = "throughput";
+    int         bar_width  = 32;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string_view a = argv[i];
+        if (a == "--input"  && i + 1 < argc) { input_path = argv[++i]; }
+        else if (a == "--metric" && i + 1 < argc) { metric = argv[++i]; }
+        else if (a == "--width"  && i + 1 < argc) { bar_width = std::atoi(argv[++i]); }
+    }
+
+    // read file
+    std::ifstream f(input_path);
+    if (!f) {
+        std::cerr << RED << "Error: cannot open " << input_path << RESET << "\n";
+        std::cerr << "  Run bench_runner first.\n";
+        return 1;
+    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string json = ss.str();
+
+    // parse top-level engine keys
+    std::map<std::string, std::map<int, Row>> data;
+    {
+        size_t p = 0;
+        while ((p = json.find('"', p)) != std::string::npos) {
+            size_t q = json.find('"', p + 1);
+            if (q == std::string::npos) break;
+            std::string key = json.substr(p + 1, q - p - 1);
+            // skip if it's a field name inside an inner object
+            if (key.empty() || key.find(':') != std::string::npos) { p = q + 1; continue; }
+            size_t brace = json.find('{', q + 1);
+            if (brace == std::string::npos || brace > q + 4) { p = q + 1; continue; }
+            // find matching close brace
+            int depth = 1;
+            size_t pos = brace + 1;
+            while (pos < json.size() && depth > 0) {
+                if (json[pos] == '{') ++depth;
+                else if (json[pos] == '}') --depth;
+                ++pos;
+            }
+            std::string block = json.substr(brace + 1, pos - brace - 2);
+            data[key] = parse_engine_block(block, key);
+            p = pos;
+        }
+    }
+
+    if (data.empty()) {
+        std::cerr << RED << "No data found in " << input_path << RESET << "\n";
+        return 1;
+    }
+
+    // collect all concurrency levels
+    std::vector<int> concs;
+    for (auto& [k, by_c] : data) {
+        for (auto& [c, _] : by_c) {
+            if (std::find(concs.begin(), concs.end(), c) == concs.end())
+                concs.push_back(c);
+        }
+    }
+    std::sort(concs.begin(), concs.end());
+
+    std::cout << "\n" << std::string(88, '=') << "\n";
+    std::cout << BOLD << "  VOIDWEB BENCHMARK REPORT" << RESET << "\n";
+    std::cout << "  Input: " << input_path << "\n";
+    std::cout << std::string(88, '=') << "\n";
+
+    for (int conc : concs) {
+        std::cout << "\n" << BOLD << "  Concurrency = " << conc << RESET << "\n";
+        std::cout << "  " << std::left;
+        printf("  %-20s %12s %10s %10s %9s %9s %5s %8s\n",
+               "Engine", "Tput tok/s", "TTFT p50", "TTFT p95", "ITL p50", "ITL p95", "OK%", "VRAM");
+        std::cout << "  " << std::string(86, '-') << "\n";
+
+        // collect rows for this concurrency level
+        std::vector<std::pair<std::string, Row>> rows;
+        for (auto& [key, by_c] : data) {
+            auto it = by_c.find(conc);
+            if (it != by_c.end()) rows.push_back({ key, it->second });
+        }
+        std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) {
+            return a.second.throughput > b.second.throughput;
+        });
+
+        double max_tput = 0;
+        for (auto& [k, r] : rows) max_tput = std::max(max_tput, r.throughput);
+
+        for (size_t i = 0; i < rows.size(); ++i) {
+            auto& [key, r] = rows[i];
+            const char* col    = ENGINE_COLORS[i < 6 ? i : 5];
+            const char* medal  = MEDALS[i < 6 ? i : 5];
+            std::string vram   = r.vram_mib > 0 ? std::to_string(r.vram_mib) + " MiB" : "  —";
+            printf("  %s %s%-18s%s %11.1f  %9.0fms %9.0fms %8.2fms %8.2fms %4.0f%% %8s\n",
+                   medal, col, r.engine.c_str(), RESET,
+                   r.throughput, r.ttft_p50_ms, r.ttft_p95_ms,
+                   r.itl_p50_ms, r.itl_p95_ms, r.success_rate, vram.c_str());
+        }
+
+        // ASCII throughput chart
+        std::cout << "\n  Throughput chart (concurrency=" << conc << "):\n";
+        for (size_t i = 0; i < rows.size(); ++i) {
+            auto& [key, r] = rows[i];
+            const char* col = ENGINE_COLORS[i < 6 ? i : 5];
+            std::string b   = bar_ascii(r.throughput, max_tput, bar_width);
+            printf("  %s%-20s%s %s  %.1f tok/s\n",
+                   col, r.engine.c_str(), RESET, b.c_str(), r.throughput);
+        }
+    }
+
+    // winner summary
+    std::cout << "\n" << std::string(88, '-') << "\n";
+    std::cout << BOLD << "  WINNER BY CATEGORY\n" << RESET;
+    std::cout << std::string(88, '-') << "\n";
+
+    std::vector<Row> all_rows;
+    for (auto& [k, by_c] : data)
+        for (auto& [c, r] : by_c)
+            all_rows.push_back(r);
+
+    auto best_tput = std::max_element(all_rows.begin(), all_rows.end(),
+        [](auto& a, auto& b) { return a.throughput < b.throughput; });
+    auto best_ttft = std::min_element(all_rows.begin(), all_rows.end(),
+        [](auto& a, auto& b) {
+            if (a.ttft_p50_ms <= 0) return false;
+            if (b.ttft_p50_ms <= 0) return true;
+            return a.ttft_p50_ms < b.ttft_p50_ms;
+        });
+    auto best_itl = std::min_element(all_rows.begin(), all_rows.end(),
+        [](auto& a, auto& b) {
+            if (a.itl_p50_ms <= 0) return false;
+            if (b.itl_p50_ms <= 0) return true;
+            return a.itl_p50_ms < b.itl_p50_ms;
+        });
+
+    if (best_tput != all_rows.end())
+        printf("  [tput]  %-20s  %.1f tok/s\n", best_tput->engine.c_str(), best_tput->throughput);
+    if (best_ttft != all_rows.end() && best_ttft->ttft_p50_ms > 0)
+        printf("  [ttft]  %-20s  %.0f ms p50\n", best_ttft->engine.c_str(), best_ttft->ttft_p50_ms);
+    if (best_itl != all_rows.end() && best_itl->itl_p50_ms > 0)
+        printf("  [itl]   %-20s  %.2f ms/tok p50\n", best_itl->engine.c_str(), best_itl->itl_p50_ms);
+
+    std::cout << std::string(88, '=') << "\n\n";
+    return 0;
+}
