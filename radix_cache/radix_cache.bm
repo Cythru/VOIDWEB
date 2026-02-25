@@ -10,6 +10,9 @@
 //!
 //! Eviction: LRU at the node level. Each node has a last_access timestamp.
 //! When VRAM pressure is high, we walk leaves-first and free the oldest.
+//!
+//! — The Archive. every sequence that completed lives here until evicted.
+//!   a ghost-path saved is a prefill not paid.
 
 use std::collections::HashMap
 use std::time
@@ -209,11 +212,13 @@ impl RadixCacheManager {
     }
 
     /// Find reusable KV blocks for `tokens`. Call before allocating new blocks.
+    // consult The Archive — ghost-path if the prefix exists, dark if not
     pub fn lookup(self: &mut RadixCacheManager, tokens: &[TokenId]) -> MatchResult {
         self.inner.lookup(tokens)
     }
 
     /// Insert a completed sequence. Call after decoding finishes.
+    // seal into The Archive — the sequence is done, its KV lives on
     pub fn insert(self: &mut RadixCacheManager, tokens: &[TokenId], blocks: &[BlockId]) {
         self.inner.insert(tokens, blocks, self.block_size)
         // Evict one LRU leaf if over budget (amortised cost)
@@ -239,7 +244,7 @@ impl RadixCacheManager {
     }
 
     fn evict_one(self: &mut RadixCacheManager) -> usize {
-        // Find oldest unreferenced leaf and clear its blocks.
+        // burn it. lru leaf goes dark. can't get it back.
         var oldest_time: u64 = u64::MAX
         var oldest_path: Vec<TokenId> = Vec::new()
         Self::find_oldest_leaf(&self.inner.root, Vec::new(), &mut oldest_time, &mut oldest_path)

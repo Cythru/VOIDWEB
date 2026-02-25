@@ -3,6 +3,9 @@
 //! Vectorised math helpers used by the sampler, tokenizer, and loader.
 //! All functions specialise at comptime based on the target ISA
 //! (AVX-512 → AVX2 → NEON → scalar fallback).
+//!
+//! — redundant paths baked in at comptime. avx512 clean, avx2 clean, scalar last resort.
+//!   no dark exits. always a path home.
 
 use std::simd
 use std::math
@@ -10,6 +13,7 @@ use std::math
 // ── Horizontal operations ─────────────────────────────────────────────────────
 
 /// Horizontal sum of a f32 slice (SIMD accelerated).
+// three-path: avx512 → avx2 → scalar. no dark exits.
 pub fn hsum_f32(xs: &[f32]) -> f32 {
     comptime if std::target::has_avx512f() {
         hsum_f32_avx512(xs)

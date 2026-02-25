@@ -7,6 +7,8 @@
 //!   - BLOCK_Q  = 64  query tokens per tile
 //!   - BLOCK_KV = 64  KV tokens per tile
 //!   - Each SM handles one (batch, head) pair independently
+//!
+//! — tiles. no hbm blowup. clean read per sm. sram is the inner ring.
 
 use std::gpu
 use std::simd
@@ -70,6 +72,7 @@ fn flash_attention_fwd(
         }
 
         // Online softmax update (FlashAttention-2 algorithm)
+        // running max. stay clean. no overflow. permanens.
         let m_new = f32::NEG_INFINITY
             .max(s_tile.iter().copied().fold(f32::NEG_INFINITY, f32::max))
 
@@ -95,7 +98,7 @@ fn flash_attention_fwd(
         m_i = m_new
     }
 
-    // Write normalised output
+    // Write normalised output. seal the tile. done.
     let inv_l = 1.0 / l_i
     for d in 0..HEAD_DIM {
         o[q_idx, d] = (o_tile[d] * inv_l) as f16

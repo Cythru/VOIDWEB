@@ -11,6 +11,8 @@
 //!
 //! Operates on a flat logit buffer shaped [num_seqs × vocab_size].
 //! Parallel sampling via async scope when batch_size > 1.
+//!
+//! — temperature 0: greedy. fast. done. anything else: probabilities, noise, worth it.
 
 use std::math
 use std::rand
@@ -103,7 +105,7 @@ fn sample_one(cfg: &SamplerConfig, logits: &[f32], prev_tokens: &[u32]) -> u32 !
         apply_rep_penalty(&mut scores, prev_tokens, cfg.repetition_penalty)
     }
 
-    // 2. Greedy shortcut.
+    // 2. Greedy shortcut. temperature 0 — greedy. fast. done.
     if cfg.temperature <= 0.0 {
         return argmax(&scores)
     }
@@ -195,6 +197,6 @@ fn multinomial_sample(probs: &[f32]) -> u32 !Rand {
         cum += p
         if rand < cum { return i as u32 }
     }
-    // Fallback to last non-zero token (floating-point rounding).
+    // fallback — floating-point rounding. not wrong. worth it.
     probs.iter().rposition(fn(&p) p > 0.0).unwrap_or(0) as u32
 }

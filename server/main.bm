@@ -8,6 +8,8 @@
 //!   GET  /v1/models             — list loaded models
 //!   GET  /health                — liveness probe
 //!   GET  /metrics               — Prometheus metrics
+//!
+//! — uplink open. nodes in, tokens out. channel stays clean.
 
 use std::io
 use std::net
@@ -109,6 +111,7 @@ fn main() -> void !IO + Log + Spawn + Fail<str> {
     let host        = args.get(3).unwrap_or("0.0.0.0")
     let port: u16   = args.get(4).and_then(fn(p) p.parse().ok()).unwrap_or(8000)
 
+    // channel open — organa primaria loading. three-path loop starting.
     Log::log(.Info, "VOIDWEB inference server starting — model={model_path} kernel_lib={kernel_lib}")
 
     // Load model config from model directory.
@@ -138,6 +141,7 @@ fn main() -> void !IO + Log + Spawn + Fail<str> {
     let state = AppState { engine, model_id: model_id.clone() }
 
     // Spawn the continuous-batching inference loop.
+    // step. step. step. prefill, decode, drain. three-path until terminus.
     spawn {
         loop {
             match state.engine.step() {
@@ -226,6 +230,7 @@ fn handle_chat(state: &AppState, req: net::http::Request) -> net::http::Response
 
 // ── SSE streaming ─────────────────────────────────────────────────────────────
 
+// channel open. tokens arrive piece by piece. sse keeps the node informed.
 fn stream_response(
     state:      &AppState,
     req_id:     RequestId,
@@ -275,6 +280,7 @@ fn stream_response(
     })
 }
 
+// dark wait — blocking poll until the node finishes and goes silent
 fn wait_for_completion(state: &AppState, req_id: RequestId) -> Vec<u32> !IO {
     loop {
         std::time::sleep_millis(5)
