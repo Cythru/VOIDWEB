@@ -1,0 +1,24 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# C/C++ build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.d
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*.swp

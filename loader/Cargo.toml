@@ -1,0 +1,15 @@
+[package]
+name        = "loader"
+description = "Model weight loader — safetensors / GGUF / sharded"
+version.workspace  = true
+edition.workspace  = true
+authors.workspace  = true
+license.workspace  = true
+
+[dependencies]
+anyhow      = { workspace = true }
+memmap2     = { workspace = true }
+rayon       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }

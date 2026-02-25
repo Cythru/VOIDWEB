@@ -1,0 +1,20 @@
+[package]
+name        = "radix_cache"
+description = "RadixAttention KV-cache prefix tree (SGLang algorithm)"
+version.workspace  = true
+edition.workspace  = true
+authors.workspace  = true
+license.workspace  = true
+
+[dependencies]
+parking_lot = { workspace = true }
+serde       = { workspace = true }
+anyhow      = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "radix_bench"
+harness = false
