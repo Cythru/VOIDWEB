@@ -146,4 +146,4 @@ Endpoints:
 
 GPL v3. See [LICENSE](LICENSE).
 
-Part of the [VoidForge](https://github.com/Cythru) open-source initiative — open systems, zero abstractions.
+Part of the [Cythru](https://github.com/Cythru) open-source initiative — open systems, zero abstractions.
