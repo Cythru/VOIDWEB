@@ -228,13 +228,13 @@
         <div class="logo">Nebula</div>
         <div class="subtitle">Privacy-First Browser</div>
 
-        <div class="search-container">
+        <form class="search-container" id="searchForm" action="https://search.ononoki.org/search" method="GET">
             <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="#5a5a7a" stroke-width="2">
                 <circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/>
             </svg>
-            <input type="text" class="search-input" placeholder="Search with SearXNG..."
-                   id="searchInput" autofocus>
-        </div>
+            <input type="text" class="search-input" name="q" placeholder="Search with SearXNG..."
+                   id="searchInput" autocomplete="off" autofocus>
+        </form>
 
         <div class="quick-links">
             <a class="quick-link" href="https://vid.puffyan.us" title="Invidious (YouTube)">
@@ -282,28 +282,28 @@
     <div class="version">NEBULA v0.1.0</div>
 
     <script>
-        // Search via SearXNG
-        document.getElementById('searchInput').addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && e.target.value.trim()) {
-                const query = encodeURIComponent(e.target.value.trim());
-                // Check if it's a URL
-                if (e.target.value.includes('.') && !e.target.value.includes(' ')) {
-                    let url = e.target.value.trim();
-                    if (!url.startsWith('http')) url = 'https://' + url;
-                    window.location.href = url;
-                } else {
-                    window.location.href = `https://search.ononoki.org/search?q=${query}`;
-                }
+        const form = document.getElementById('searchForm');
+        const input = document.getElementById('searchInput');
+
+        // Handle form submit — catches Enter key naturally, only fires once
+        form.addEventListener('submit', (e) => {
+            const val = input.value.trim();
+            if (!val) { e.preventDefault(); return; }
+
+            // If it looks like a URL, navigate directly
+            if (val.includes('.') && !val.includes(' ')) {
+                e.preventDefault();
+                let url = val;
+                if (!url.startsWith('http')) url = 'https://' + url;
+                window.location.href = url;
             }
+            // Otherwise let the form submit to SearXNG normally (action + name="q")
         });
 
         // Focus search on any keypress
         document.addEventListener('keydown', (e) => {
-            const input = document.getElementById('searchInput');
             if (document.activeElement !== input && !e.ctrlKey && !e.altKey && !e.metaKey) {
-                if (e.key.length === 1) {
-                    input.focus();
-                }
+                if (e.key.length === 1) input.focus();
             }
         });
     </script>
