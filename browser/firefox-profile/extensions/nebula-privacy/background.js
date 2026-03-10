@@ -16,10 +16,10 @@ const FRONTEND_REDIRECTS = {
             /^https?:\/\/m\.youtube\.com/,
         ],
         instances: [
-            'https://vid.puffyan.us',
             'https://yewtu.be',
-            'https://inv.riverside.rocks',
-            'https://invidious.snopyta.org',
+            'https://invidious.fdn.fr',
+            'https://inv.tux.pizza',
+            'https://invidious.protokolla.fi',
         ],
         rewrite: (url, instance) => {
             const u = new URL(url);
@@ -39,9 +39,9 @@ const FRONTEND_REDIRECTS = {
             /^https?:\/\/mobile\.(twitter|x)\.com/,
         ],
         instances: [
-            'https://nitter.poast.org',
             'https://nitter.privacydev.net',
             'https://nitter.1d4.us',
+            'https://nitter.poast.org',
         ],
         rewrite: (url, instance) => {
             const u = new URL(url);
@@ -82,9 +82,9 @@ const FRONTEND_REDIRECTS = {
         enabled: true,
         patterns: [/^https?:\/\/(www\.)?google\.com\/search/],
         instances: [
-            'https://search.ononoki.org',
-            'https://searx.tiekoetter.com',
             'https://searx.be',
+            'https://search.sapti.me',
+            'https://searx.tiekoetter.com',
         ],
         rewrite: (url, instance) => {
             const u = new URL(url);

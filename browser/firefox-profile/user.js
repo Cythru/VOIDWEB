@@ -8,13 +8,15 @@
 // CENSORSHIP RESISTANCE
 // =============================================================
 
-// DNS-over-HTTPS (encrypted DNS — ISPs can't see or block queries)
+// DNS-over-HTTPS via Quad9 (privacy-focused, blocks malware domains)
+// Quad9 does NOT log queries, is operated by a Swiss nonprofit, and
+// blocks known malicious domains automatically.
 user_pref("network.trr.mode", 3);  // 3 = DoH ONLY, no fallback to plaintext
-user_pref("network.trr.uri", "https://mozilla.cloudflare-dns.com/dns-query");
-user_pref("network.trr.custom_uri", "https://mozilla.cloudflare-dns.com/dns-query");
-user_pref("network.trr.bootstrapAddr", "1.1.1.1");
-// Backup DoH resolvers
-user_pref("network.trr.resolvers", '[{"url":"https://mozilla.cloudflare-dns.com/dns-query"},{"url":"https://dns.quad9.net/dns-query"},{"url":"https://dns.google/dns-query"}]');
+user_pref("network.trr.uri", "https://dns.quad9.net/dns-query");
+user_pref("network.trr.custom_uri", "https://dns.quad9.net/dns-query");
+user_pref("network.trr.bootstrapAddr", "9.9.9.9");
+// Backup DoH resolvers (Quad9 primary, Cloudflare fallback — NO Google)
+user_pref("network.trr.resolvers", '[{"url":"https://dns.quad9.net/dns-query"},{"url":"https://mozilla.cloudflare-dns.com/dns-query"},{"url":"https://dns.mullvad.net/dns-query"}]');
 
 // Encrypted Client Hello (ECH) — hides which site you're visiting from ISP
 user_pref("network.dns.echconfig.enabled", true);
