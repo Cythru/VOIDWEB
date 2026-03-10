@@ -1,0 +1,69 @@
+/* NebulaBrowser — Custom Chrome CSS */
+/* Dark, minimal, privacy-focused UI */
+
+/* Enable userChrome.css */
+@namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+
+/* Dark background for toolbar */
+:root {
+    --nebula-bg: #0a0a0f;
+    --nebula-toolbar: #12121a;
+    --nebula-accent: #7b68ee;  /* Medium slate blue */
+    --nebula-text: #c8c8d0;
+    --nebula-url: #9090ff;
+    --nebula-border: #1a1a2e;
+}
+
+/* Main toolbar background */
+#navigator-toolbox {
+    background: var(--nebula-toolbar) !important;
+    border-bottom: 1px solid var(--nebula-border) !important;
+}
+
+/* URL bar */
+#urlbar-background {
+    background: var(--nebula-bg) !important;
+    border: 1px solid var(--nebula-border) !important;
+    border-radius: 6px !important;
+}
+
+#urlbar-input {
+    color: var(--nebula-url) !important;
+    font-family: 'JetBrains Mono', 'Cascadia Code', monospace !important;
+}
+
+/* Tab bar */
+.tabbrowser-tab {
+    background: var(--nebula-toolbar) !important;
+    border-radius: 4px 4px 0 0 !important;
+}
+
+.tabbrowser-tab[selected="true"] {
+    background: var(--nebula-bg) !important;
+    border-top: 2px solid var(--nebula-accent) !important;
+}
+
+/* Tab text */
+.tab-label {
+    color: var(--nebula-text) !important;
+}
+
+/* Hide Firefox branding */
+#identity-icon-box {
+    display: none !important;
+}
+
+/* Hide Pocket button */
+#save-to-pocket-button {
+    display: none !important;
+}
+
+/* Hide Firefox account button */
+#fxa-toolbar-menu-button {
+    display: none !important;
+}
+
+/* Hide sponsored shortcuts */
+.top-site-outer.sponsored {
+    display: none !important;
+}
