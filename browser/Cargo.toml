@@ -1,0 +1,52 @@
+[package]
+name = "nebula-browser"
+version = "0.1.0"
+edition = "2021"
+description = "NebulaBrowser — Privacy-first web browser powered by VOIDWEB"
+license = "GPL-3.0"
+
+[lib]
+name = "nebula"
+path = "lib.rs"
+
+# Rust components: networking, security, ad blocking, Tor, VoidShield
+[dependencies]
+# Tor integration
+# arti-client = "0.12"
+# arti-hyper = "0.12"
+
+# Crypto (auth vault)
+# argon2 = "0.5"
+# aes-gcm = "0.10"
+# hmac = "0.12"
+# sha1 = "0.10"
+# x25519-dalek = "2"
+
+# Sandboxing
+# landlock = "0.3"
+# seccomp = "0.1"
+# caps = "0.5"
+
+# Serialization
+# serde = { version = "1", features = ["derive"] }
+# serde_json = "1"
+
+# HTTP client
+# reqwest = { version = "0.12", features = ["socks", "rustls-tls"] }
+
+# Async runtime
+# tokio = { version = "1", features = ["full"] }
+
+# Logging
+# tracing = "0.1"
+# tracing-subscriber = "0.3"
+
+[dev-dependencies]
+# For testing
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

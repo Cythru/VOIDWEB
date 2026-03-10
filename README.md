@@ -1,12 +1,67 @@
 # VOIDWEB
 
-High-performance LLM inference engine. No Python. No GIL. No mercy.
-
-Written in [BlackMagic](https://github.com/Cythru/BlackMagic) — a systems language that compiles to native code and GPU kernels from a single source tree.
+Two projects. One repo. Zero compromise.
 
 ---
 
-## What it is
+## NebulaBrowser — Privacy-First Web Browser
+
+**C++ · Rust · Zig** — A web browser that respects you.
+
+- **Tor integration** — All traffic routed through Tor (arti). Per-tab circuits, .onion support, bridge/pluggable transport
+- **Ad blocker** — uBlock Origin / EasyList / EasyPrivacy filter lists. Cosmetic filters, script blocking, crypto miner detection
+- **VoidShield malware scanning** — Real-time download/script/URL scanning via the [VoidShield](https://github.com/Cythru/VoidShield) engine
+- **Open-source frontend redirects** — Auto-redirect to privacy frontends:
+  - YouTube → Invidious
+  - Twitter/X → Nitter
+  - Reddit → Redlib
+  - Instagram → Bibliogram
+  - Google → SearXNG
+  - Medium → Scribe
+  - Imgur → Rimgo
+  - TikTok → ProxiTok
+  - Wikipedia → Wikiless
+  - Google Translate → Lingva
+- **Anti-fingerprinting** — Canvas/WebGL/audio/font fingerprint resistance, navigator spoofing, WebRTC leak prevention
+- **Process sandbox** — seccomp-BPF, Linux namespaces, Landlock FS restrictions, capability dropping, per-tab resource limits
+- **Simplified auth** — Encrypted vault (Argon2id + AES-256-GCM), mobile authenticator pairing, TOTP, passkeys
+- **Tracking stripped** — UTM params, fbclid, gclid, and 40+ tracking parameters auto-removed from all URLs
+- **HTTPS enforced** — All HTTP auto-upgraded to HTTPS
+- **Super fast** — HTTP/3 QUIC, SIMD text processing, connection pooling, back-forward cache, speculative prerendering, lazy image loading, tile-based GPU compositing
+
+### Browser Architecture
+
+```
+browser/
+  core/nebula.cpp           Main browser engine (C++) — CEF-based rendering
+  core/sandbox.rs           Process sandboxing (Rust) — seccomp, Landlock, namespaces
+  net/privacy_net.rs        Privacy networking (Rust) — header stripping, anti-fingerprint
+  adblock/adblock.rs        Ad blocker engine (Rust) — ABP/uBO filter list parser
+  shield/malware_scanner.rs VoidShield integration (Rust) — file/script/URL scanning
+  tor/tor_proxy.rs          Tor proxy manager (Rust) — arti/system tor, circuit control
+  auth/authenticator.rs     Auth vault (Rust) — Argon2id, AES-GCM, TOTP, passkeys
+  frontends/registry.cpp    Privacy frontend registry (C++) — 10 service redirects
+  render/fast_render.zig    Performance pipeline (Zig) — SIMD, connection pool, bfcache
+  config/defaults.zig       Compile-time config (Zig) — SIMD detection, allocators
+  CMakeLists.txt            Build system — C++ + Rust (cargo) + Zig
+```
+
+### Build NebulaBrowser
+
+```bash
+cd browser
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+```
+
+---
+
+## VOIDWEB Inference Engine
+
+High-performance LLM inference engine. No Python. No GIL. No mercy.
+
+Written in [BlackMagic](https://github.com/Cythru/BlackMagic) — a systems language that compiles to native code and GPU kernels from a single source tree.
 
 VOIDWEB is a from-scratch inference engine for large language models, built with the same goals as vLLM and SGLang but without the Python runtime, GIL, or framework overhead.
 

@@ -1,0 +1,286 @@
+// VOIDWEB — Privacy Frontend Registry
+// Auto-redirects popular sites to open-source privacy-respecting frontends.
+// User can toggle per-service or globally.
+
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <regex>
+#include <optional>
+
+namespace voidweb::frontends {
+
+struct Frontend {
+    std::string name;          // Human-readable name
+    std::string project_url;   // Project homepage
+    std::string default_instance;
+    std::vector<std::string> instances; // Public instances
+    bool enabled = true;
+};
+
+struct RedirectRule {
+    std::string service;       // e.g. "youtube"
+    std::regex url_pattern;
+    std::string frontend_key;
+    // Transform original URL path to frontend URL
+    std::string (*rewrite)(const std::string& original_url, const std::string& instance);
+};
+
+// --- Rewrite functions ---
+
+static std::string rewrite_youtube(const std::string& url, const std::string& instance) {
+    // youtube.com/watch?v=XXX -> instance/watch?v=XXX
+    // youtu.be/XXX -> instance/watch?v=XXX
+    std::regex watch_re(R"((?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]+))");
+    std::smatch m;
+    if (std::regex_search(url, m, watch_re)) {
+        return instance + "/watch?v=" + m[1].str();
+    }
+    // Channel, playlist, etc. — pass path through
+    std::regex path_re(R"(youtube\.com(/.*))");
+    if (std::regex_search(url, m, path_re)) {
+        return instance + m[1].str();
+    }
+    return instance;
+}
+
+static std::string rewrite_twitter(const std::string& url, const std::string& instance) {
+    std::regex path_re(R"((?:twitter\.com|x\.com)(/.*))");
+    std::smatch m;
+    if (std::regex_search(url, m, path_re)) {
+        return instance + m[1].str();
+    }
+    return instance;
+}
+
+static std::string rewrite_reddit(const std::string& url, const std::string& instance) {
+    std::regex path_re(R"((?:old\.)?reddit\.com(/.*))");
+    std::smatch m;
+    if (std::regex_search(url, m, path_re)) {
+        return instance + m[1].str();
+    }
+    return instance;
+}
+
+static std::string rewrite_instagram(const std::string& url, const std::string& instance) {
+    std::regex path_re(R"(instagram\.com(/.*))");
+    std::smatch m;
+    if (std::regex_search(url, m, path_re)) {
+        return instance + m[1].str();
+    }
+    return instance;
+}
+
+static std::string rewrite_medium(const std::string& url, const std::string& instance) {
+    std::regex path_re(R"(medium\.com(/.*))");
+    std::smatch m;
+    if (std::regex_search(url, m, path_re)) {
+        return instance + m[1].str();
+    }
+    return instance;
+}
+
+static std::string rewrite_imgur(const std::string& url, const std::string& instance) {
+    std::regex path_re(R"(imgur\.com(/.*))");
+    std::smatch m;
+    if (std::regex_search(url, m, path_re)) {
+        return instance + m[1].str();
+    }
+    return instance;
+}
+
+static std::string rewrite_tiktok(const std::string& url, const std::string& instance) {
+    std::regex path_re(R"(tiktok\.com(/.*))");
+    std::smatch m;
+    if (std::regex_search(url, m, path_re)) {
+        return instance + m[1].str();
+    }
+    return instance;
+}
+
+static std::string rewrite_search(const std::string& url, const std::string& instance) {
+    std::regex query_re(R"(google\.com/search\?(.+))");
+    std::smatch m;
+    if (std::regex_search(url, m, query_re)) {
+        return instance + "/search?" + m[1].str();
+    }
+    return instance;
+}
+
+static std::string rewrite_wikipedia(const std::string& url, const std::string& instance) {
+    std::regex path_re(R"(wikipedia\.org(/.*))");
+    std::smatch m;
+    if (std::regex_search(url, m, path_re)) {
+        return instance + m[1].str();
+    }
+    return instance;
+}
+
+static std::string rewrite_translate(const std::string& url, const std::string& instance) {
+    std::regex path_re(R"(translate\.google\.com(/.*))");
+    std::smatch m;
+    if (std::regex_search(url, m, path_re)) {
+        return instance + m[1].str();
+    }
+    return instance;
+}
+
+class FrontendRegistry {
+public:
+    FrontendRegistry() {
+        register_defaults();
+    }
+
+    // Check if URL should be redirected, return new URL if so
+    std::optional<std::string> try_redirect(const std::string& url) const {
+        for (const auto& rule : rules_) {
+            if (!frontends_.at(rule.frontend_key).enabled) continue;
+            if (std::regex_search(url, rule.url_pattern)) {
+                const auto& fe = frontends_.at(rule.frontend_key);
+                return rule.rewrite(url, fe.default_instance);
+            }
+        }
+        return std::nullopt;
+    }
+
+    void set_enabled(const std::string& frontend_key, bool enabled) {
+        if (frontends_.count(frontend_key)) {
+            frontends_[frontend_key].enabled = enabled;
+        }
+    }
+
+    bool is_enabled(const std::string& key) const {
+        auto it = frontends_.find(key);
+        return it != frontends_.end() && it->second.enabled;
+    }
+
+    void set_instance(const std::string& key, const std::string& instance) {
+        if (frontends_.count(key)) {
+            frontends_[key].default_instance = instance;
+        }
+    }
+
+    const std::unordered_map<std::string, Frontend>& all() const { return frontends_; }
+
+private:
+    std::unordered_map<std::string, Frontend> frontends_;
+    std::vector<RedirectRule> rules_;
+
+    void register_defaults() {
+        // --- YouTube → Invidious ---
+        frontends_["invidious"] = {
+            "Invidious", "https://invidious.io",
+            "https://vid.puffyan.us",
+            {"https://vid.puffyan.us", "https://invidious.snopyta.org",
+             "https://yewtu.be", "https://inv.riverside.rocks"},
+            true
+        };
+        rules_.push_back({"youtube",
+            std::regex(R"((?:www\.)?(?:youtube\.com|youtu\.be))", std::regex::icase),
+            "invidious", rewrite_youtube});
+
+        // --- Twitter/X → Nitter ---
+        frontends_["nitter"] = {
+            "Nitter", "https://nitter.net",
+            "https://nitter.poast.org",
+            {"https://nitter.poast.org", "https://nitter.privacydev.net",
+             "https://nitter.1d4.us"},
+            true
+        };
+        rules_.push_back({"twitter",
+            std::regex(R"((?:www\.)?(?:twitter\.com|x\.com))", std::regex::icase),
+            "nitter", rewrite_twitter});
+
+        // --- Reddit → Redlib ---
+        frontends_["redlib"] = {
+            "Redlib", "https://github.com/redlib-org/redlib",
+            "https://safereddit.com",
+            {"https://safereddit.com", "https://redlib.catsarch.com",
+             "https://libreddit.kavin.rocks"},
+            true
+        };
+        rules_.push_back({"reddit",
+            std::regex(R"((?:www\.|old\.)?reddit\.com)", std::regex::icase),
+            "redlib", rewrite_reddit});
+
+        // --- Instagram → Bibliogram ---
+        frontends_["bibliogram"] = {
+            "Bibliogram", "https://bibliogram.art",
+            "https://bibliogram.art",
+            {"https://bibliogram.art"},
+            true
+        };
+        rules_.push_back({"instagram",
+            std::regex(R"((?:www\.)?instagram\.com)", std::regex::icase),
+            "bibliogram", rewrite_instagram});
+
+        // --- Google Search → SearXNG ---
+        frontends_["searxng"] = {
+            "SearXNG", "https://searxng.org",
+            "https://search.ononoki.org",
+            {"https://search.ononoki.org", "https://searx.tiekoetter.com",
+             "https://search.sapti.me", "https://searx.be"},
+            true
+        };
+        rules_.push_back({"google",
+            std::regex(R"((?:www\.)?google\.com/search)", std::regex::icase),
+            "searxng", rewrite_search});
+
+        // --- Medium → Scribe ---
+        frontends_["scribe"] = {
+            "Scribe", "https://sr.ht/~edwardloveall/Scribe",
+            "https://scribe.rip",
+            {"https://scribe.rip", "https://scribe.nixnet.services"},
+            true
+        };
+        rules_.push_back({"medium",
+            std::regex(R"((?:www\.)?medium\.com)", std::regex::icase),
+            "scribe", rewrite_medium});
+
+        // --- Imgur → Rimgo ---
+        frontends_["rimgo"] = {
+            "Rimgo", "https://codeberg.org/video-prize-ranch/rimgo",
+            "https://rimgo.pussthecat.org",
+            {"https://rimgo.pussthecat.org", "https://rimgo.totaldarkness.net"},
+            true
+        };
+        rules_.push_back({"imgur",
+            std::regex(R"((?:www\.)?imgur\.com)", std::regex::icase),
+            "rimgo", rewrite_imgur});
+
+        // --- TikTok → ProxiTok ---
+        frontends_["proxitok"] = {
+            "ProxiTok", "https://github.com/pablouser1/ProxiTok",
+            "https://proxitok.pabloferreiro.es",
+            {"https://proxitok.pabloferreiro.es", "https://proxitok.pussthecat.org"},
+            true
+        };
+        rules_.push_back({"tiktok",
+            std::regex(R"((?:www\.)?tiktok\.com)", std::regex::icase),
+            "proxitok", rewrite_tiktok});
+
+        // --- Wikipedia → Wikiless ---
+        frontends_["wikiless"] = {
+            "Wikiless", "https://codeberg.org/orenom/wikiless",
+            "https://wikiless.org",
+            {"https://wikiless.org", "https://wikiless.northboot.xyz"},
+            true
+        };
+        rules_.push_back({"wikipedia",
+            std::regex(R"((?:\w+\.)?wikipedia\.org)", std::regex::icase),
+            "wikiless", rewrite_wikipedia});
+
+        // --- Google Translate → Lingva ---
+        frontends_["lingva"] = {
+            "Lingva Translate", "https://github.com/thedaviddelta/lingva-translate",
+            "https://lingva.ml",
+            {"https://lingva.ml", "https://translate.plausibility.cloud"},
+            true
+        };
+        rules_.push_back({"translate",
+            std::regex(R"(translate\.google\.com)", std::regex::icase),
+            "lingva", rewrite_translate});
+    }
+};
+
+} // namespace voidweb::frontends

@@ -1,0 +1,350 @@
+// NebulaBrowser — High-Performance Rendering Pipeline (Zig)
+// Zero-copy, SIMD-accelerated HTML/CSS processing for maximum speed.
+// Works alongside CEF but handles pre-processing, caching, and resource optimization.
+
+const std = @import("std");
+
+/// Page resource types
+const ResourceType = enum {
+    html,
+    css,
+    javascript,
+    image,
+    font,
+    video,
+    audio,
+    other,
+};
+
+/// Resource loading priority
+const Priority = enum(u8) {
+    critical = 0, // HTML, critical CSS
+    high = 1, // Visible images, fonts
+    medium = 2, // Below-fold content
+    low = 3, // Prefetch, analytics (if not blocked)
+    blocked = 255, // Ads, trackers — never load
+};
+
+/// Preconnect hints for faster loading
+const PreconnectHint = struct {
+    host: []const u8,
+    port: u16 = 443,
+    is_h3: bool = false, // HTTP/3 QUIC
+};
+
+/// Performance configuration
+pub const PerfConfig = struct {
+    /// Enable speculative preloading of likely-next pages
+    speculative_preload: bool = true,
+    /// Cache DNS resolutions aggressively
+    dns_prefetch: bool = true,
+    /// Use HTTP/3 QUIC where available
+    prefer_h3: bool = true,
+    /// Lazy load images below the fold
+    lazy_load_images: bool = true,
+    /// Compress in-memory page cache with zstd
+    compress_cache: bool = true,
+    /// Max concurrent connections per host
+    max_connections_per_host: u8 = 6,
+    /// Connection pool size
+    connection_pool_size: u16 = 64,
+    /// Enable bfcache (back-forward cache)
+    bfcache: bool = true,
+    /// Max pages in bfcache
+    bfcache_max: u8 = 10,
+    /// Prerender hovered links
+    prerender_on_hover: bool = true,
+    /// Hover delay before prerender (ms)
+    prerender_delay_ms: u32 = 150,
+    /// SIMD-accelerated text processing
+    simd_text: bool = true,
+    /// Zero-copy IPC between processes
+    zero_copy_ipc: bool = true,
+    /// GPU-accelerated compositing
+    gpu_compositing: bool = true,
+    /// Tile-based rendering
+    tiled_rendering: bool = true,
+    /// Tile size (pixels)
+    tile_size: u16 = 256,
+};
+
+pub const default_perf_config = PerfConfig{};
+
+/// Resource scheduler — prioritizes critical resources, defers non-essential
+pub const ResourceScheduler = struct {
+    const Self = @This();
+
+    pending: [256]?ScheduledResource = .{null} ** 256,
+    pending_count: usize = 0,
+    config: PerfConfig,
+
+    const ScheduledResource = struct {
+        url_hash: u64,
+        resource_type: ResourceType,
+        priority: Priority,
+        size_hint: u32, // Expected size in bytes
+        is_preload: bool,
+    };
+
+    pub fn init(config: PerfConfig) Self {
+        return .{ .config = config };
+    }
+
+    /// Schedule a resource for loading
+    pub fn schedule(self: *Self, url_hash: u64, rtype: ResourceType, is_preload: bool) void {
+        if (self.pending_count >= self.pending.len) return;
+
+        const priority: Priority = switch (rtype) {
+            .html => .critical,
+            .css => .critical,
+            .javascript => .high,
+            .font => .high,
+            .image => if (is_preload) .low else .medium,
+            .video, .audio => .low,
+            .other => .low,
+        };
+
+        self.pending[self.pending_count] = .{
+            .url_hash = url_hash,
+            .resource_type = rtype,
+            .priority = priority,
+            .size_hint = 0,
+            .is_preload = is_preload,
+        };
+        self.pending_count += 1;
+    }
+
+    /// Get next resource to load (highest priority first)
+    pub fn next(self: *Self) ?ScheduledResource {
+        if (self.pending_count == 0) return null;
+
+        var best_idx: usize = 0;
+        var best_pri: u8 = 255;
+        for (0..self.pending_count) |i| {
+            if (self.pending[i]) |res| {
+                if (@intFromEnum(res.priority) < best_pri) {
+                    best_pri = @intFromEnum(res.priority);
+                    best_idx = i;
+                }
+            }
+        }
+
+        const result = self.pending[best_idx];
+        // Remove by swapping with last
+        self.pending[best_idx] = self.pending[self.pending_count - 1];
+        self.pending[self.pending_count - 1] = null;
+        self.pending_count -= 1;
+        return result;
+    }
+};
+
+/// SIMD-accelerated HTML entity decoding
+pub fn decode_entities_simd(input: []const u8, output: []u8) usize {
+    const vec_size = std.simd.suggestVectorLength(u8) orelse 16;
+    const V = @Vector(vec_size, u8);
+
+    var in_pos: usize = 0;
+    var out_pos: usize = 0;
+
+    // SIMD scan for '&' characters
+    while (in_pos + vec_size <= input.len and out_pos + vec_size <= output.len) {
+        const chunk: V = input[in_pos..][0..vec_size].*;
+        const amp_mask = chunk == @as(V, @splat('&'));
+
+        if (@reduce(.Or, amp_mask)) {
+            // Found '&' — fall back to scalar for this chunk
+            break;
+        }
+
+        // No entities — direct copy
+        output[out_pos..][0..vec_size].* = input[in_pos..][0..vec_size].*;
+        in_pos += vec_size;
+        out_pos += vec_size;
+    }
+
+    // Scalar fallback for remainder and entity decoding
+    while (in_pos < input.len and out_pos < output.len) {
+        if (input[in_pos] == '&') {
+            // Decode common entities
+            const remaining = input[in_pos..];
+            if (starts_with(remaining, "&amp;")) {
+                output[out_pos] = '&';
+                in_pos += 5;
+            } else if (starts_with(remaining, "&lt;")) {
+                output[out_pos] = '<';
+                in_pos += 4;
+            } else if (starts_with(remaining, "&gt;")) {
+                output[out_pos] = '>';
+                in_pos += 4;
+            } else if (starts_with(remaining, "&quot;")) {
+                output[out_pos] = '"';
+                in_pos += 6;
+            } else if (starts_with(remaining, "&apos;")) {
+                output[out_pos] = '\'';
+                in_pos += 6;
+            } else if (starts_with(remaining, "&#")) {
+                // Numeric entity — parse
+                output[out_pos] = '?'; // Simplified
+                while (in_pos < input.len and input[in_pos] != ';') : (in_pos += 1) {}
+                if (in_pos < input.len) in_pos += 1; // skip ';'
+            } else {
+                output[out_pos] = input[in_pos];
+                in_pos += 1;
+            }
+        } else {
+            output[out_pos] = input[in_pos];
+            in_pos += 1;
+        }
+        out_pos += 1;
+    }
+
+    return out_pos;
+}
+
+fn starts_with(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len < needle.len) return false;
+    return std.mem.eql(u8, haystack[0..needle.len], needle);
+}
+
+/// Fast URL hasher for cache lookups (FNV-1a)
+pub fn hash_url(url: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (url) |byte| {
+        h ^= byte;
+        h *%= 0x100000001b3;
+    }
+    return h;
+}
+
+/// Connection pool — reuse TCP/TLS connections across requests
+pub const ConnectionPool = struct {
+    const Self = @This();
+    const MAX_CONNS = 128;
+
+    const PoolEntry = struct {
+        host_hash: u64,
+        port: u16,
+        is_h2: bool,
+        is_h3: bool,
+        last_used: i64,
+        active: bool,
+    };
+
+    entries: [MAX_CONNS]?PoolEntry = .{null} ** MAX_CONNS,
+    count: usize = 0,
+
+    /// Get or create a connection to host
+    pub fn acquire(self: *Self, host: []const u8, port: u16) ?*PoolEntry {
+        const h = hash_url(host);
+
+        // Look for existing connection
+        for (&self.entries) |*slot| {
+            if (slot.*) |*entry| {
+                if (entry.host_hash == h and entry.port == port and !entry.active) {
+                    entry.active = true;
+                    entry.last_used = std.time.milliTimestamp();
+                    return entry;
+                }
+            }
+        }
+
+        // Create new connection
+        if (self.count < MAX_CONNS) {
+            for (&self.entries) |*slot| {
+                if (slot.* == null) {
+                    slot.* = .{
+                        .host_hash = h,
+                        .port = port,
+                        .is_h2 = true,
+                        .is_h3 = false,
+                        .last_used = std.time.milliTimestamp(),
+                        .active = true,
+                    };
+                    self.count += 1;
+                    return &(slot.*.?);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// Release a connection back to the pool
+    pub fn release(self: *Self, entry: *PoolEntry) void {
+        _ = self;
+        entry.active = false;
+        entry.last_used = std.time.milliTimestamp();
+    }
+
+    /// Evict idle connections older than max_idle_ms
+    pub fn evict_idle(self: *Self, max_idle_ms: i64) void {
+        const now = std.time.milliTimestamp();
+        for (&self.entries) |*slot| {
+            if (slot.*) |*entry| {
+                if (!entry.active and (now - entry.last_used) > max_idle_ms) {
+                    slot.* = null;
+                    self.count -= 1;
+                }
+            }
+        }
+    }
+};
+
+/// Back-forward cache — instant back/forward navigation
+pub const BFCache = struct {
+    const Self = @This();
+    const MAX_ENTRIES = 10;
+
+    const CachedPage = struct {
+        url_hash: u64,
+        dom_snapshot: ?[]u8, // Serialized DOM state
+        scroll_x: i32,
+        scroll_y: i32,
+        cached_at: i64,
+    };
+
+    entries: [MAX_ENTRIES]?CachedPage = .{null} ** MAX_ENTRIES,
+    head: usize = 0,
+
+    /// Cache current page state before navigating away
+    pub fn store(self: *Self, url: []const u8, dom: []u8, scroll_x: i32, scroll_y: i32) void {
+        self.entries[self.head] = .{
+            .url_hash = hash_url(url),
+            .dom_snapshot = dom,
+            .scroll_x = scroll_x,
+            .scroll_y = scroll_y,
+            .cached_at = std.time.milliTimestamp(),
+        };
+        self.head = (self.head + 1) % MAX_ENTRIES;
+    }
+
+    /// Retrieve cached page for instant back navigation
+    pub fn retrieve(self: *Self, url: []const u8) ?CachedPage {
+        const h = hash_url(url);
+        for (&self.entries) |*slot| {
+            if (slot.*) |entry| {
+                if (entry.url_hash == h) {
+                    const result = entry;
+                    slot.* = null;
+                    return result;
+                }
+            }
+        }
+        return null;
+    }
+};
+
+test "hash_url consistency" {
+    const h1 = hash_url("https://example.com/page");
+    const h2 = hash_url("https://example.com/page");
+    const h3 = hash_url("https://other.com/page");
+    try std.testing.expectEqual(h1, h2);
+    try std.testing.expect(h1 != h3);
+}
+
+test "entity decoding" {
+    var output: [256]u8 = undefined;
+    const len = decode_entities_simd("Hello &amp; World &lt;b&gt;test&lt;/b&gt;", &output);
+    const result = output[0..len];
+    try std.testing.expectEqualStrings("Hello & World <b>test</b>", result);
+}
