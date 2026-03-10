@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NebulaBrowser</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+        background: #050510;
+        color: #b8b8d0;
+        font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        position: relative;
+    }
+
+    /* Animated nebula background */
+    body::before {
+        content: '';
+        position: fixed;
+        top: -50%;
+        left: -50%;
+        width: 200%;
+        height: 200%;
+        background:
+            radial-gradient(ellipse at 20% 50%, rgba(108, 92, 231, 0.08) 0%, transparent 50%),
+            radial-gradient(ellipse at 80% 20%, rgba(0, 206, 201, 0.05) 0%, transparent 50%),
+            radial-gradient(ellipse at 60% 80%, rgba(162, 155, 254, 0.04) 0%, transparent 50%);
+        animation: nebula-drift 30s ease-in-out infinite alternate;
+        z-index: 0;
+    }
+
+    @keyframes nebula-drift {
+        0% { transform: translate(0, 0) rotate(0deg); }
+        100% { transform: translate(-30px, 20px) rotate(3deg); }
+    }
+
+    /* Star field */
+    body::after {
+        content: '';
+        position: fixed;
+        top: 0; left: 0;
+        width: 100%; height: 100%;
+        background-image:
+            radial-gradient(1px 1px at 10% 15%, rgba(255,255,255,0.3) 50%, transparent 50%),
+            radial-gradient(1px 1px at 25% 35%, rgba(255,255,255,0.2) 50%, transparent 50%),
+            radial-gradient(1px 1px at 40% 65%, rgba(255,255,255,0.15) 50%, transparent 50%),
+            radial-gradient(1px 1px at 55% 25%, rgba(255,255,255,0.25) 50%, transparent 50%),
+            radial-gradient(1px 1px at 70% 80%, rgba(255,255,255,0.2) 50%, transparent 50%),
+            radial-gradient(1px 1px at 85% 45%, rgba(255,255,255,0.3) 50%, transparent 50%),
+            radial-gradient(1px 1px at 15% 75%, rgba(255,255,255,0.15) 50%, transparent 50%),
+            radial-gradient(1px 1px at 90% 10%, rgba(255,255,255,0.25) 50%, transparent 50%),
+            radial-gradient(1px 1px at 35% 90%, rgba(255,255,255,0.2) 50%, transparent 50%),
+            radial-gradient(1px 1px at 60% 50%, rgba(255,255,255,0.15) 50%, transparent 50%),
+            radial-gradient(2px 2px at 5% 55%, rgba(108,92,231,0.4) 50%, transparent 50%),
+            radial-gradient(2px 2px at 75% 5%, rgba(0,206,201,0.3) 50%, transparent 50%),
+            radial-gradient(1.5px 1.5px at 45% 40%, rgba(162,155,254,0.35) 50%, transparent 50%);
+        animation: stars-twinkle 8s ease-in-out infinite alternate;
+        z-index: 0;
+    }
+
+    @keyframes stars-twinkle {
+        0% { opacity: 0.6; }
+        50% { opacity: 1; }
+        100% { opacity: 0.7; }
+    }
+
+    .container {
+        position: relative;
+        z-index: 1;
+        text-align: center;
+        max-width: 600px;
+        width: 90%;
+    }
+
+    /* Logo */
+    .logo {
+        font-size: 42px;
+        font-weight: 700;
+        letter-spacing: 8px;
+        text-transform: uppercase;
+        background: linear-gradient(135deg, #6c5ce7 0%, #a29bfe 40%, #00cec9 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        margin-bottom: 4px;
+        text-shadow: none;
+        user-select: none;
+    }
+
+    .subtitle {
+        font-size: 11px;
+        letter-spacing: 6px;
+        text-transform: uppercase;
+        color: #5a5a7a;
+        margin-bottom: 40px;
+        font-weight: 400;
+    }
+
+    /* Search bar */
+    .search-container {
+        position: relative;
+        margin-bottom: 50px;
+    }
+
+    .search-input {
+        width: 100%;
+        padding: 14px 24px 14px 48px;
+        background: rgba(15, 15, 36, 0.8);
+        border: 1px solid #1e1e3a;
+        border-radius: 24px;
+        color: #e8e8f0;
+        font-size: 15px;
+        font-family: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+        outline: none;
+        transition: all 0.3s ease;
+        backdrop-filter: blur(10px);
+    }
+
+    .search-input:focus {
+        border-color: rgba(108, 92, 231, 0.5);
+        box-shadow: 0 0 20px rgba(108, 92, 231, 0.15);
+        background: rgba(15, 15, 36, 0.95);
+    }
+
+    .search-input::placeholder {
+        color: #3a3a5a;
+    }
+
+    .search-icon {
+        position: absolute;
+        left: 18px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 18px;
+        height: 18px;
+        opacity: 0.4;
+    }
+
+    /* Privacy quick links */
+    .quick-links {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 12px;
+        margin-bottom: 40px;
+    }
+
+    .quick-link {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 16px 8px;
+        background: rgba(15, 15, 36, 0.5);
+        border: 1px solid transparent;
+        border-radius: 12px;
+        text-decoration: none;
+        color: #8a8aa0;
+        font-size: 11px;
+        transition: all 0.2s ease;
+        cursor: pointer;
+        backdrop-filter: blur(5px);
+    }
+
+    .quick-link:hover {
+        background: rgba(108, 92, 231, 0.1);
+        border-color: rgba(108, 92, 231, 0.3);
+        color: #c8c8e0;
+        transform: translateY(-2px);
+    }
+
+    .quick-link .icon {
+        font-size: 22px;
+        margin-bottom: 6px;
+    }
+
+    /* Status bar */
+    .status {
+        display: flex;
+        gap: 24px;
+        justify-content: center;
+        flex-wrap: wrap;
+    }
+
+    .status-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: #4a4a6a;
+        letter-spacing: 1px;
+    }
+
+    .status-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        display: inline-block;
+    }
+
+    .status-dot.active {
+        background: #55efc4;
+        box-shadow: 0 0 8px rgba(85, 239, 196, 0.5);
+    }
+
+    .status-dot.inactive {
+        background: #636e72;
+    }
+
+    /* Version text */
+    .version {
+        position: fixed;
+        bottom: 16px;
+        right: 20px;
+        font-size: 10px;
+        color: #2a2a40;
+        letter-spacing: 2px;
+        z-index: 1;
+    }
+</style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">Nebula</div>
+        <div class="subtitle">Privacy-First Browser</div>
+
+        <div class="search-container">
+            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="#5a5a7a" stroke-width="2">
+                <circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/>
+            </svg>
+            <input type="text" class="search-input" placeholder="Search with SearXNG..."
+                   id="searchInput" autofocus>
+        </div>
+
+        <div class="quick-links">
+            <a class="quick-link" href="https://vid.puffyan.us" title="Invidious (YouTube)">
+                <span class="icon">&#9654;</span>
+                Videos
+            </a>
+            <a class="quick-link" href="https://nitter.poast.org" title="Nitter (Twitter)">
+                <span class="icon">&#9993;</span>
+                Social
+            </a>
+            <a class="quick-link" href="https://safereddit.com" title="Redlib (Reddit)">
+                <span class="icon">&#9741;</span>
+                Forums
+            </a>
+            <a class="quick-link" href="https://search.ononoki.org" title="SearXNG">
+                <span class="icon">&#128269;</span>
+                Search
+            </a>
+            <a class="quick-link" href="https://wikiless.org" title="Wikiless (Wikipedia)">
+                <span class="icon">&#128214;</span>
+                Wiki
+            </a>
+        </div>
+
+        <div class="status">
+            <div class="status-item">
+                <span class="status-dot active"></span>
+                DoH ENCRYPTED
+            </div>
+            <div class="status-item">
+                <span class="status-dot active"></span>
+                FINGERPRINT SPOOFED
+            </div>
+            <div class="status-item">
+                <span class="status-dot active"></span>
+                TRACKERS BLOCKED
+            </div>
+            <div class="status-item" id="torStatus">
+                <span class="status-dot inactive"></span>
+                TOR OFFLINE
+            </div>
+        </div>
+    </div>
+
+    <div class="version">NEBULA v0.1.0</div>
+
+    <script>
+        // Search via SearXNG
+        document.getElementById('searchInput').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && e.target.value.trim()) {
+                const query = encodeURIComponent(e.target.value.trim());
+                // Check if it's a URL
+                if (e.target.value.includes('.') && !e.target.value.includes(' ')) {
+                    let url = e.target.value.trim();
+                    if (!url.startsWith('http')) url = 'https://' + url;
+                    window.location.href = url;
+                } else {
+                    window.location.href = `https://search.ononoki.org/search?q=${query}`;
+                }
+            }
+        });
+
+        // Focus search on any keypress
+        document.addEventListener('keydown', (e) => {
+            const input = document.getElementById('searchInput');
+            if (document.activeElement !== input && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                if (e.key.length === 1) {
+                    input.focus();
+                }
+            }
+        });
+    </script>
+</body>
+</html>

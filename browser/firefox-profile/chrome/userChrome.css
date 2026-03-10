@@ -1,69 +1,414 @@
-/* NebulaBrowser — Custom Chrome CSS */
-/* Dark, minimal, privacy-focused UI */
+/* ═══════════════════════════════════════════════════════════
+   NebulaBrowser — Custom UI Theme
+   Deep space aesthetic, nothing like default Firefox
+   ═══════════════════════════════════════════════════════════ */
 
-/* Enable userChrome.css */
 @namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+@namespace html url("http://www.w3.org/1999/xhtml");
 
-/* Dark background for toolbar */
 :root {
-    --nebula-bg: #0a0a0f;
-    --nebula-toolbar: #12121a;
-    --nebula-accent: #7b68ee;  /* Medium slate blue */
-    --nebula-text: #c8c8d0;
-    --nebula-url: #9090ff;
-    --nebula-border: #1a1a2e;
+    /* Nebula color palette — deep space purple/cyan */
+    --nebula-void: #050510;
+    --nebula-bg: #0b0b1a;
+    --nebula-surface: #0f0f24;
+    --nebula-elevated: #141432;
+    --nebula-accent: #6c5ce7;       /* Vivid purple */
+    --nebula-accent-glow: #a29bfe;  /* Light purple glow */
+    --nebula-cyan: #00cec9;         /* Teal accent */
+    --nebula-text: #b8b8d0;
+    --nebula-text-bright: #e8e8f0;
+    --nebula-text-dim: #5a5a7a;
+    --nebula-url: #74b9ff;
+    --nebula-secure: #55efc4;       /* Green for HTTPS */
+    --nebula-warning: #fdcb6e;
+    --nebula-danger: #ff6b6b;
+    --nebula-border: #1e1e3a;
+    --nebula-glow: 0 0 12px rgba(108, 92, 231, 0.3);
+    --nebula-tab-radius: 10px;
+
+    /* Override Firefox variables */
+    --lwt-accent-color: var(--nebula-void) !important;
+    --lwt-text-color: var(--nebula-text) !important;
+    --toolbar-bgcolor: var(--nebula-bg) !important;
+    --toolbar-color: var(--nebula-text) !important;
+    --tab-selected-bgcolor: var(--nebula-elevated) !important;
+    --urlbar-box-bgcolor: var(--nebula-surface) !important;
 }
 
-/* Main toolbar background */
-#navigator-toolbox {
-    background: var(--nebula-toolbar) !important;
-    border-bottom: 1px solid var(--nebula-border) !important;
+/* ═══════════════════════════════════════
+   TITLE BAR — Gone. Pure borderless.
+   ═══════════════════════════════════════ */
+
+#titlebar {
+    -moz-appearance: none !important;
+    background: var(--nebula-void) !important;
 }
 
-/* URL bar */
-#urlbar-background {
-    background: var(--nebula-bg) !important;
-    border: 1px solid var(--nebula-border) !important;
-    border-radius: 6px !important;
+/* Hide window controls text, keep buttons */
+.titlebar-spacer { display: none !important; }
+
+/* ═══════════════════════════════════════
+   TAB BAR — Floating pill tabs
+   ═══════════════════════════════════════ */
+
+#TabsToolbar {
+    background: var(--nebula-void) !important;
+    padding: 6px 8px 0 8px !important;
+    border: none !important;
 }
 
-#urlbar-input {
-    color: var(--nebula-url) !important;
-    font-family: 'JetBrains Mono', 'Cascadia Code', monospace !important;
-}
-
-/* Tab bar */
+/* Remove default tab shapes */
 .tabbrowser-tab {
-    background: var(--nebula-toolbar) !important;
-    border-radius: 4px 4px 0 0 !important;
+    -moz-appearance: none !important;
+    background: transparent !important;
+    border: none !important;
+    margin: 0 2px !important;
+    padding: 0 !important;
+    min-height: 34px !important;
+    border-radius: var(--nebula-tab-radius) !important;
+    transition: all 0.2s ease !important;
 }
 
-.tabbrowser-tab[selected="true"] {
-    background: var(--nebula-bg) !important;
-    border-top: 2px solid var(--nebula-accent) !important;
+/* Tab background container */
+.tab-background {
+    -moz-appearance: none !important;
+    border: none !important;
+    border-radius: var(--nebula-tab-radius) !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    outline: none !important;
+    box-shadow: none !important;
+}
+
+/* Inactive tabs — subtle glass effect */
+.tabbrowser-tab:not([selected="true"]) .tab-background {
+    background: rgba(20, 20, 50, 0.5) !important;
+    border: 1px solid transparent !important;
+}
+
+.tabbrowser-tab:not([selected="true"]):hover .tab-background {
+    background: rgba(30, 30, 60, 0.8) !important;
+    border: 1px solid var(--nebula-border) !important;
+}
+
+/* Active tab — glowing pill */
+.tabbrowser-tab[selected="true"] .tab-background {
+    background: linear-gradient(135deg, var(--nebula-elevated) 0%, rgba(108, 92, 231, 0.15) 100%) !important;
+    border: 1px solid rgba(108, 92, 231, 0.4) !important;
+    box-shadow: var(--nebula-glow), inset 0 1px 0 rgba(255,255,255,0.03) !important;
 }
 
 /* Tab text */
 .tab-label {
+    color: var(--nebula-text-dim) !important;
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif !important;
+    font-size: 12px !important;
+    font-weight: 500 !important;
+}
+
+.tabbrowser-tab[selected="true"] .tab-label {
+    color: var(--nebula-text-bright) !important;
+    font-weight: 600 !important;
+}
+
+.tabbrowser-tab:hover .tab-label {
     color: var(--nebula-text) !important;
 }
 
-/* Hide Firefox branding */
-#identity-icon-box {
+/* Tab close button */
+.tab-close-button {
+    opacity: 0 !important;
+    transition: opacity 0.15s ease !important;
+}
+
+.tabbrowser-tab:hover .tab-close-button {
+    opacity: 0.6 !important;
+}
+
+.tab-close-button:hover {
+    opacity: 1 !important;
+    background: var(--nebula-danger) !important;
+    border-radius: 50% !important;
+}
+
+/* Tab separator lines — remove */
+.tabbrowser-tab::after,
+.tabbrowser-tab::before {
     display: none !important;
 }
 
-/* Hide Pocket button */
-#save-to-pocket-button {
-    display: none !important;
+/* New tab button */
+#tabs-newtab-button,
+#TabsToolbar #new-tab-button {
+    -moz-appearance: none !important;
+    background: transparent !important;
+    border: 1px dashed rgba(108, 92, 231, 0.3) !important;
+    border-radius: var(--nebula-tab-radius) !important;
+    margin: 0 4px !important;
+    opacity: 0.5 !important;
+    transition: all 0.2s ease !important;
 }
 
-/* Hide Firefox account button */
-#fxa-toolbar-menu-button {
-    display: none !important;
+#tabs-newtab-button:hover,
+#TabsToolbar #new-tab-button:hover {
+    background: rgba(108, 92, 231, 0.1) !important;
+    border-color: var(--nebula-accent) !important;
+    opacity: 1 !important;
 }
 
-/* Hide sponsored shortcuts */
-.top-site-outer.sponsored {
-    display: none !important;
+/* ═══════════════════════════════════════
+   NAVIGATION BAR — Sleek & minimal
+   ═══════════════════════════════════════ */
+
+#nav-bar {
+    background: var(--nebula-bg) !important;
+    border: none !important;
+    padding: 4px 8px !important;
+    box-shadow: 0 1px 0 var(--nebula-border) !important;
+}
+
+/* Back/Forward/Reload buttons */
+#back-button,
+#forward-button,
+#reload-button,
+#stop-button {
+    -moz-appearance: none !important;
+    border-radius: 8px !important;
+    padding: 4px !important;
+    margin: 0 1px !important;
+    transition: all 0.15s ease !important;
+}
+
+#back-button:hover,
+#forward-button:hover,
+#reload-button:hover,
+#stop-button:hover {
+    background: var(--nebula-elevated) !important;
+}
+
+#back-button image,
+#forward-button image,
+#reload-button image,
+#stop-button image {
+    fill: var(--nebula-accent-glow) !important;
+    opacity: 0.8 !important;
+}
+
+/* ═══════════════════════════════════════
+   URL BAR — Floating search bar
+   ═══════════════════════════════════════ */
+
+#urlbar {
+    --urlbar-height: 36px !important;
+    margin: 2px 100px !important;   /* Centered, not full width */
+    border-radius: 18px !important;
+    transition: all 0.2s ease !important;
+}
+
+#urlbar-background {
+    background: var(--nebula-surface) !important;
+    border: 1px solid var(--nebula-border) !important;
+    border-radius: 18px !important;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.3) !important;
+    transition: all 0.2s ease !important;
+}
+
+/* URL bar focused — glow effect */
+#urlbar[focused="true"] #urlbar-background,
+#urlbar[open] #urlbar-background {
+    border-color: rgba(108, 92, 231, 0.5) !important;
+    box-shadow: var(--nebula-glow), inset 0 1px 3px rgba(0,0,0,0.3) !important;
+}
+
+#urlbar-input {
+    color: var(--nebula-url) !important;
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace !important;
+    font-size: 13px !important;
+    text-align: center !important;
+}
+
+#urlbar[focused="true"] #urlbar-input,
+#urlbar[open] #urlbar-input {
+    text-align: left !important;
+}
+
+/* HTTPS lock icon — green glow */
+#identity-icon {
+    fill: var(--nebula-secure) !important;
+}
+
+#identity-box.verifiedDomain #identity-icon,
+#identity-box.mixedActiveBlocked #identity-icon {
+    fill: var(--nebula-secure) !important;
+}
+
+/* Tracking protection shield — cyan */
+#tracking-protection-icon-container {
+    border-radius: 6px !important;
+}
+
+#tracking-protection-icon {
+    fill: var(--nebula-cyan) !important;
+}
+
+/* ═══════════════════════════════════════
+   TOOLBAR BUTTONS — Minimal icons
+   ═══════════════════════════════════════ */
+
+toolbarbutton {
+    -moz-appearance: none !important;
+}
+
+#PanelUI-button,
+#unified-extensions-button {
+    border-radius: 8px !important;
+    transition: background 0.15s ease !important;
+}
+
+#PanelUI-button:hover,
+#unified-extensions-button:hover {
+    background: var(--nebula-elevated) !important;
+}
+
+/* Menu button — replace hamburger with cleaner icon */
+#PanelUI-menu-button {
+    border-radius: 8px !important;
+    padding: 4px 6px !important;
+}
+
+#PanelUI-menu-button:hover {
+    background: var(--nebula-elevated) !important;
+}
+
+/* ═══════════════════════════════════════
+   HIDE FIREFOX BRANDING / CLUTTER
+   ═══════════════════════════════════════ */
+
+/* Hide Pocket */
+#save-to-pocket-button { display: none !important; }
+
+/* Hide Firefox account */
+#fxa-toolbar-menu-button { display: none !important; }
+
+/* Hide Firefox View (tab overview) */
+#firefox-view-button { display: none !important; }
+
+/* Hide import bookmarks star */
+#import-button { display: none !important; }
+
+/* Hide all page action icons except lock */
+#pageActionButton { display: none !important; }
+#page-action-buttons > :not(#star-button-box) { display: none !important; }
+
+/* Hide sponsored content */
+.top-site-outer.sponsored { display: none !important; }
+
+/* ═══════════════════════════════════════
+   SIDEBAR — Dark glass
+   ═══════════════════════════════════════ */
+
+#sidebar-box {
+    background: var(--nebula-void) !important;
+    border-right: 1px solid var(--nebula-border) !important;
+}
+
+#sidebar-header {
+    background: var(--nebula-bg) !important;
+    border-bottom: 1px solid var(--nebula-border) !important;
+}
+
+/* ═══════════════════════════════════════
+   FINDBAR — Bottom bar styling
+   ═══════════════════════════════════════ */
+
+findbar {
+    background: var(--nebula-bg) !important;
+    border-top: 1px solid var(--nebula-border) !important;
+}
+
+findbar textbox {
+    background: var(--nebula-surface) !important;
+    color: var(--nebula-text) !important;
+    border: 1px solid var(--nebula-border) !important;
+    border-radius: 6px !important;
+}
+
+/* ═══════════════════════════════════════
+   CONTEXT MENUS / POPUPS
+   ═══════════════════════════════════════ */
+
+menupopup,
+panel {
+    --panel-background: var(--nebula-elevated) !important;
+    --panel-color: var(--nebula-text) !important;
+    --panel-border-color: var(--nebula-border) !important;
+}
+
+menupopup {
+    -moz-appearance: none !important;
+    background: var(--nebula-elevated) !important;
+    color: var(--nebula-text) !important;
+    border: 1px solid var(--nebula-border) !important;
+    border-radius: 8px !important;
+    padding: 4px !important;
+}
+
+menuitem:hover,
+menu:hover {
+    background: rgba(108, 92, 231, 0.2) !important;
+    border-radius: 4px !important;
+}
+
+menuseparator {
+    border-color: var(--nebula-border) !important;
+}
+
+/* ═══════════════════════════════════════
+   AUTOCOMPLETE / SUGGESTIONS DROPDOWN
+   ═══════════════════════════════════════ */
+
+#urlbar .urlbarView {
+    background: var(--nebula-bg) !important;
+    border: 1px solid var(--nebula-border) !important;
+    border-radius: 12px !important;
+    margin-top: 4px !important;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5) !important;
+}
+
+.urlbarView-row:hover,
+.urlbarView-row[selected] {
+    background: rgba(108, 92, 231, 0.15) !important;
+    border-radius: 6px !important;
+}
+
+.urlbarView-url {
+    color: var(--nebula-url) !important;
+}
+
+.urlbarView-title {
+    color: var(--nebula-text-bright) !important;
+}
+
+/* ═══════════════════════════════════════
+   SCROLLBAR — Thin & dark
+   ═══════════════════════════════════════ */
+
+* {
+    scrollbar-width: thin !important;
+    scrollbar-color: var(--nebula-elevated) transparent !important;
+}
+
+/* ═══════════════════════════════════════
+   ANIMATIONS — Smooth transitions
+   ═══════════════════════════════════════ */
+
+/* Tab loading indicator — purple instead of blue */
+.tabbrowser-tab[busy] .tab-throbber,
+.tabbrowser-tab[busy] .tab-icon-pending {
+    fill: var(--nebula-accent) !important;
+}
+
+/* Loading bar at top — purple gradient */
+#tabbrowser-tabbox {
+    transition: background 0.3s ease !important;
 }

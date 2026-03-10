@@ -264,10 +264,20 @@ user_pref("layout.css.prefers-color-scheme.content-override", 0);  // Dark
 user_pref("browser.compactmode.show", true);
 user_pref("browser.uidensity", 1);  // Compact
 
-// Homepage
-user_pref("browser.startup.homepage", "about:blank");
-user_pref("browser.startup.page", 0);  // Blank page
+// Enable userChrome.css (REQUIRED for NebulaBrowser theme)
+user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
+
+// Homepage — NebulaBrowser custom new tab
+user_pref("browser.startup.homepage", "file://__PROFILE_DIR__/newtab.html");
+user_pref("browser.startup.page", 1);  // Homepage
 user_pref("browser.newtabpage.enabled", false);
+user_pref("browser.newtab.url", "file://__PROFILE_DIR__/newtab.html");
+
+// Disable default Firefox new tab
+user_pref("browser.newtabpage.activity-stream.enabled", false);
+user_pref("browser.newtabpage.activity-stream.feeds.topsites", false);
+user_pref("browser.newtabpage.activity-stream.feeds.section.highlights", false);
+user_pref("browser.newtabpage.activity-stream.feeds.snippets", false);
 
 // Disable annoying defaults
 user_pref("browser.aboutConfig.showWarning", false);
@@ -275,6 +285,10 @@ user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.tabs.warnOnClose", false);
 user_pref("browser.warnOnQuit", false);
 user_pref("general.warnOnAboutConfig", false);
+
+// Disable default bookmarks/import
+user_pref("browser.bookmarks.restore_default_bookmarks", false);
+user_pref("browser.places.importBookmarksHTML", false);
 
 // =============================================================
 // PERFORMANCE
