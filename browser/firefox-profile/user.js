@@ -291,25 +291,224 @@ user_pref("browser.bookmarks.restore_default_bookmarks", false);
 user_pref("browser.places.importBookmarksHTML", false);
 
 // =============================================================
-// PERFORMANCE
+// PERFORMANCE — MAXIMUM VELOCITY
 // =============================================================
 
-// HTTP/3 QUIC support
+// ─────────────────────────────────────────────────────────────
+// GPU / RENDERING — Push everything to hardware
+// ─────────────────────────────────────────────────────────────
+
+// WebRender — Rust GPU compositor (Firefox's fastest renderer)
+user_pref("gfx.webrender.all", true);
+user_pref("gfx.webrender.compositor", true);
+user_pref("gfx.webrender.compositor.force-enabled", true);
+user_pref("gfx.webrender.enabled", true);
+
+// Force hardware acceleration globally
+user_pref("layers.acceleration.force-enabled", true);
+user_pref("layers.gpu-process.enabled", true);
+user_pref("layers.gpu-process.force-enabled", true);
+user_pref("layers.offmainthreadcomposition.enabled", true);
+user_pref("layers.offmainthreadcomposition.async-animations", true);
+
+// Hardware video decode (VA-API on Linux)
+user_pref("media.ffmpeg.vaapi.enabled", true);
+user_pref("media.ffvpx.enabled", true);
+user_pref("media.hardware-video-decoding.enabled", true);
+user_pref("media.hardware-video-decoding.force-enabled", true);
+
+// GPU-accelerated canvas
+user_pref("gfx.canvas.accelerated", true);
+user_pref("gfx.canvas.accelerated.cache-items", 8192);
+user_pref("gfx.canvas.accelerated.cache-size", 1024);
+
+// Image rendering — parallel decode
+user_pref("image.mem.decode_bytes_at_a_time", 65536);  // 64KB chunks (default 16KB)
+user_pref("image.mem.shared.unmap.min_expiration_ms", 120000);
+user_pref("image.cache.size", 10485760);  // 10MB image cache
+
+// ─────────────────────────────────────────────────────────────
+// JAVASCRIPT ENGINE — JIT compiler cranked to max
+// ─────────────────────────────────────────────────────────────
+
+// Baseline JIT — compile immediately (default waits 10 calls)
+user_pref("javascript.options.baselinejit.threshold", 0);
+
+// Ion (optimizing JIT) — compile earlier (default 1000)
+user_pref("javascript.options.ion.threshold", 100);
+
+// Enable all JIT tiers
+user_pref("javascript.options.ion", true);
+user_pref("javascript.options.baselinejit", true);
+user_pref("javascript.options.wasm", true);
+user_pref("javascript.options.wasm_optimizingjit", true);
+user_pref("javascript.options.wasm_baselinejit", true);
+
+// Larger JIT code cache
+user_pref("javascript.options.mem.max", -1);  // Unlimited JS memory
+user_pref("javascript.options.mem.gc_incremental", true);
+user_pref("javascript.options.mem.gc_per_zone", true);
+user_pref("javascript.options.mem.gc_incremental_slice_ms", 5);  // Shorter GC pauses
+
+// WASM streaming compilation (compile while downloading)
+user_pref("javascript.options.wasm_streaming", true);
+
+// ─────────────────────────────────────────────────────────────
+// NETWORK — Maximum throughput
+// ─────────────────────────────────────────────────────────────
+
+// HTTP/3 QUIC — fastest protocol
 user_pref("network.http.http3.enabled", true);
+user_pref("network.http.http3.default-qpack-table-size", 65536);
+user_pref("network.http.http3.default-max-stream-blocked", 20);
 
-// Faster TLS
+// HTTP/2 — multiplexed connections
+user_pref("network.http.http2.enabled", true);
+user_pref("network.http.http2.enabled.deps", true);
+user_pref("network.http.http2.chunk-size", 32768);  // 32KB chunks
+
+// Connection limits — way more parallel connections
+user_pref("network.http.max-connections", 1800);           // Total (default 900)
+user_pref("network.http.max-persistent-connections-per-server", 10);  // Per host (default 6)
+user_pref("network.http.max-persistent-connections-per-proxy", 48);
+user_pref("network.http.max-urgent-start-excessive-connections-per-host", 6);
+
+// Pipelining (send multiple requests without waiting)
+user_pref("network.http.pacing.requests.enabled", false);  // Don't throttle requests
+user_pref("network.http.pacing.requests.min-parallelism", 10);
+
+// Bigger network buffers
+user_pref("network.buffer.cache.size", 262144);    // 256KB (default 32KB)
+user_pref("network.buffer.cache.count", 128);       // More buffers (default 24)
+
+// TCP tuning
+user_pref("network.tcp.tcp_fastopen_enable", true);  // TCP Fast Open (save 1 RTT)
+user_pref("network.tcp.tcp_fastopen_consecutive_failure_limit", 5);
+
+// DNS — bigger cache, parallel resolution
+user_pref("network.dnsCacheEntries", 10000);        // Cache 10K domains (default 400)
+user_pref("network.dnsCacheExpiration", 86400);      // 24h cache (default 60s)
+
+// Faster TLS handshake
 user_pref("network.ssl_tokens_cache_capacity", 32768);
+user_pref("security.ssl.enable_false_start", true);   // Send data before TLS done
+user_pref("network.http.fast-fallback-to-IPv4", true);
 
-// Session restore off (privacy + speed)
+// ─────────────────────────────────────────────────────────────
+// SPECULATIVE LOADING — Pre-fetch & pre-connect
+// ─────────────────────────────────────────────────────────────
+// NOTE: We disabled prefetch for PRIVACY above. These are safe alternatives
+// that don't leak browsing intent because they only activate on hover/click.
+
+// Speculative connections on hover (pre-open TCP+TLS to link targets)
+user_pref("network.http.speculative-parallel-limit", 10);
+
+// Pre-connect to sites likely to be visited
+user_pref("network.predictor.enabled", true);
+user_pref("network.predictor.enable-hover-on-ssl", true);
+user_pref("network.predictor.max-resources-per-entry", 250);
+user_pref("network.predictor.max-uri-length", 1000);
+
+// ─────────────────────────────────────────────────────────────
+// MEMORY / CACHE — All RAM, zero disk I/O
+// ─────────────────────────────────────────────────────────────
+
+// Kill disk cache completely (no disk I/O lag, no forensic traces)
+user_pref("browser.cache.disk.enable", false);
+user_pref("browser.cache.disk.capacity", 0);
+user_pref("browser.cache.disk_cache_ssl", false);
+user_pref("browser.cache.offline.enable", false);
+
+// Massive RAM cache
+user_pref("browser.cache.memory.enable", true);
+user_pref("browser.cache.memory.capacity", 1048576);  // 1GB RAM cache
+user_pref("browser.cache.memory.max_entry_size", 51200);  // 50MB max single entry
+
+// Back-forward cache (instant back/forward navigation)
+user_pref("fission.bfcacheInParent", true);
+
+// Session store — minimal disk writes
 user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.sessionstore.max_tabs_undo", 0);
 user_pref("browser.sessionstore.max_windows_undo", 0);
+user_pref("browser.sessionstore.interval", 999999999);  // Basically never write
 
-// Disk cache off (RAM only — faster + no forensic traces)
-user_pref("browser.cache.disk.enable", false);
-user_pref("browser.cache.memory.enable", true);
-user_pref("browser.cache.memory.capacity", 524288);  // 512MB RAM cache
+// ─────────────────────────────────────────────────────────────
+// PROCESS MODEL — Parallel rendering
+// ─────────────────────────────────────────────────────────────
 
-// GPU acceleration
-user_pref("layers.acceleration.force-enabled", true);
-user_pref("gfx.webrender.all", true);
+// Fission (site isolation) — each site gets its own process
+user_pref("fission.autostart", true);
+
+// Content processes — more = more parallelism
+user_pref("dom.ipc.processCount", 16);              // Up from default 8
+user_pref("dom.ipc.processCount.webIsolated", 8);   // Isolated site processes
+
+// Prioritize foreground tab
+user_pref("dom.ipc.processPriorityManager.enabled", true);
+
+// ─────────────────────────────────────────────────────────────
+// RENDERING PIPELINE — Reduce latency
+// ─────────────────────────────────────────────────────────────
+
+// Faster initial paint
+user_pref("nglayout.initialpaint.delay", 0);          // Paint immediately (default 5ms)
+user_pref("nglayout.initialpaint.delay_in_oopif", 0);
+
+// Content paint delay
+user_pref("content.notify.interval", 100000);  // 100ms between reflows (less CPU thrash)
+user_pref("content.notify.backoffcount", 5);
+
+// Reduce reflow/relayout overhead
+user_pref("layout.frame_rate", 0);  // 0 = match monitor refresh rate (auto 60Hz)
+
+// Smooth scrolling — keep but optimize
+user_pref("general.smoothScroll", true);
+user_pref("general.smoothScroll.currentVelocityWeighting", 0);
+user_pref("general.smoothScroll.mouseWheel.durationMaxMS", 150);
+user_pref("general.smoothScroll.mouseWheel.durationMinMS", 100);
+user_pref("general.smoothScroll.stopDecelerationWeighting", 0.82);
+user_pref("mousewheel.min_line_scroll_amount", 25);  // Snappier scroll
+
+// Compositor — vsync aligned, async
+user_pref("layout.display-list.improve-fragmentation", true);
+
+// ─────────────────────────────────────────────────────────────
+// MEDIA — Fast decode, lazy load
+// ─────────────────────────────────────────────────────────────
+
+// Lazy loading images (don't load below-fold images until scroll)
+user_pref("dom.image-lazy-loading.enabled", true);
+
+// Autoplay blocking (saves bandwidth + CPU)
+user_pref("media.autoplay.default", 5);  // Block all autoplay
+user_pref("media.autoplay.blocking_policy", 2);
+
+// Video decode threads
+user_pref("media.ffmpeg.thread-count", 0);  // 0 = auto (uses all cores)
+
+// ─────────────────────────────────────────────────────────────
+// REDUCE OVERHEAD — Kill background waste
+// ─────────────────────────────────────────────────────────────
+
+// Throttle background tabs aggressively
+user_pref("dom.min_background_timeout_value", 10000);    // 10s (default 1s)
+user_pref("dom.min_background_timeout_value_without_budget_throttling", 10000);
+user_pref("dom.timeout.throttling_delay", 60000);         // 60s throttle delay
+
+// Reduce timer resolution in background (saves CPU)
+user_pref("timer.minimum_firing_delay_tolerance_ms", 5);
+user_pref("timer.minimum_firing_delay_tolerance_ms.always", 5);
+
+// Disable Accessibility (significant perf hit if not needed)
+user_pref("accessibility.force_disabled", 1);
+
+// Disable animations in UI (snappier feel)
+user_pref("toolkit.cosmeticAnimations.enabled", false);
+user_pref("ui.prefersReducedMotion", 1);
+
+// Skip confirmation dialogs
+user_pref("browser.tabs.closeWindowWithLastTab", false);
+
+// Disable spell checking (CPU overhead)
+user_pref("layout.spellcheckDefault", 0);
