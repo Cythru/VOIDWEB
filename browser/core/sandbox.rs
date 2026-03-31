@@ -46,16 +46,38 @@ pub struct SandboxPolicy {
     pub process_limit: u64,
 }
 
+/// Returns OS-appropriate readable paths for fonts and TLS certificates.
+fn system_read_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    // Linux (including Android/Termux prefix)
+    for p in &["/usr/share/fonts", "/usr/share/ca-certificates", "/etc/ssl/certs", "/etc/fonts",
+               // Termux prefix
+               "/data/data/com.termux/files/usr/share/ca-certificates"] {
+        let pb = PathBuf::from(p);
+        if pb.exists() { paths.push(pb); }
+    }
+    // macOS
+    if cfg!(target_os = "macos") {
+        for p in &["/Library/Fonts", "/System/Library/Fonts",
+                   "/etc/ssl/cert.pem", "/usr/local/etc/ca-certificates"] {
+            let pb = PathBuf::from(p);
+            if pb.exists() { paths.push(pb); }
+        }
+    }
+    // Windows
+    if cfg!(target_os = "windows") {
+        if let Ok(win) = std::env::var("WINDIR") {
+            paths.push(PathBuf::from(format!("{win}/Fonts")));
+        }
+    }
+    paths
+}
+
 impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
             level: SandboxLevel::Maximum,
-            fs_read: vec![
-                PathBuf::from("/usr/share/fonts"),
-                PathBuf::from("/usr/share/ca-certificates"),
-                PathBuf::from("/etc/ssl/certs"),
-                PathBuf::from("/etc/fonts"),
-            ],
+            fs_read: system_read_paths(),
             fs_write: vec![],
             allow_network: true,
             allowed_ports: vec![80, 443, 9150], // HTTP, HTTPS, Tor SOCKS
