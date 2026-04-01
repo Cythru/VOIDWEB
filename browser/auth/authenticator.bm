@@ -1,0 +1,221 @@
+// NebulaBrowser — Simplified Authentication System
+// Replaces complex password managers with a mobile authenticator approach.
+// One master key + TOTP/push verification from phone.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// Authentication method
+#[derive(Debug, Clone)]
+pub enum AuthMethod {
+    /// Password-based (stored encrypted)
+    Password { encrypted: Vec<u8> },
+    /// Passkey / WebAuthn (FIDO2)
+    Passkey { credential_id: Vec<u8>, public_key: Vec<u8> },
+    /// TOTP code from mobile authenticator
+    Totp { secret: Vec<u8>, digits: u8, period: u32 },
+    /// Push notification to mobile app
+    Push { device_id: String },
+}
+
+/// Stored credential for a site
+#[derive(Debug, Clone)]
+pub struct SiteCredential {
+    pub domain: String,
+    pub username: String,
+    pub auth_methods: Vec<AuthMethod>,
+    pub last_used: u64,
+    pub auto_fill: bool,
+}
+
+/// Mobile authenticator pairing
+#[derive(Debug, Clone)]
+pub struct MobilePairing {
+    pub device_name: String,
+    pub device_id: String,
+    pub paired_at: u64,
+    pub public_key: Vec<u8>,
+    pub push_token: Option<String>,
+}
+
+/// Master key derivation (Argon2id)
+pub struct MasterKey {
+    derived_key: [u8; 32],
+}
+
+impl MasterKey {
+    /// Derive master key from password using Argon2id
+    pub fn from_password(password: &str, salt: &[u8; 16]) -> Self {
+        // In production: use argon2 crate with:
+        //   m_cost: 65536 (64 MB)
+        //   t_cost: 3 iterations
+        //   p_cost: 4 parallelism
+        // For now, placeholder
+        let mut key = [0u8; 32];
+        // argon2id_hash(password, salt, &mut key);
+        let _ = password;
+        let _ = salt;
+        Self { derived_key: key }
+    }
+
+    pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+        // AES-256-GCM encryption with random nonce
+        // nonce (12 bytes) || ciphertext || tag (16 bytes)
+        let _ = plaintext;
+        Vec::new() // placeholder
+    }
+
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        let _ = ciphertext;
+        Ok(Vec::new()) // placeholder
+    }
+}
+
+/// TOTP generator (RFC 6238)
+pub fn generate_totp(secret: &[u8], time: u64, digits: u8, period: u32) -> String {
+    let counter = time / period as u64;
+    let counter_bytes = counter.to_be_bytes();
+
+    // HMAC-SHA1(secret, counter)
+    // In production: use hmac + sha1 crates
+    let _ = secret;
+    let _ = counter_bytes;
+
+    // Truncate to `digits` decimal digits
+    let code = 0u32; // placeholder
+    format!("{:0>width$}", code % 10u32.pow(digits as u32), width = digits as usize)
+}
+
+/// The authentication manager
+pub struct AuthManager {
+    credentials: HashMap<String, SiteCredential>,
+    mobile_devices: Vec<MobilePairing>,
+    master_key: Option<MasterKey>,
+    vault_path: PathBuf,
+}
+
+impl AuthManager {
+    pub fn new(vault_path: PathBuf) -> Self {
+        Self {
+            credentials: HashMap::new(),
+            mobile_devices: Vec::new(),
+            master_key: None,
+            vault_path,
+        }
+    }
+
+    /// Unlock the vault with master password
+    pub fn unlock(&mut self, password: &str) -> Result<(), String> {
+        let salt_path = self.vault_path.join("salt");
+        let salt = if salt_path.exists() {
+            let bytes = std::fs::read(&salt_path)
+                .map_err(|e| format!("Failed to read salt: {}", e))?;
+            let mut salt = [0u8; 16];
+            salt.copy_from_slice(&bytes[..16]);
+            salt
+        } else {
+            // First time — generate new salt
+            let mut salt = [0u8; 16];
+            // getrandom::getrandom(&mut salt);
+            std::fs::create_dir_all(&self.vault_path)
+                .map_err(|e| format!("Failed to create vault: {}", e))?;
+            std::fs::write(&salt_path, &salt)
+                .map_err(|e| format!("Failed to write salt: {}", e))?;
+            salt
+        };
+
+        self.master_key = Some(MasterKey::from_password(password, &salt));
+        self.load_credentials()?;
+        Ok(())
+    }
+
+    /// Get credentials for auto-fill
+    pub fn get_credential(&self, domain: &str) -> Option<&SiteCredential> {
+        self.credentials.get(domain)
+    }
+
+    /// Save a new credential
+    pub fn save_credential(&mut self, cred: SiteCredential) -> Result<(), String> {
+        self.credentials.insert(cred.domain.clone(), cred);
+        self.save_vault()
+    }
+
+    /// Pair with a mobile authenticator
+    pub fn pair_mobile(&mut self, device_name: &str) -> Result<String, String> {
+        // Generate QR code data for mobile app to scan
+        // Contains: browser public key, pairing token, API endpoint
+        let device_id = format!("nebula_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis());
+
+        let pairing = MobilePairing {
+            device_name: device_name.into(),
+            device_id: device_id.clone(),
+            paired_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            public_key: Vec::new(), // Generated X25519 key
+            push_token: None,
+        };
+
+        self.mobile_devices.push(pairing);
+
+        // Return QR code data as base64
+        Ok(format!("nebula://pair/{}", device_id))
+    }
+
+    /// Verify a TOTP code from mobile
+    pub fn verify_totp(&self, domain: &str, code: &str) -> bool {
+        if let Some(cred) = self.credentials.get(domain) {
+            for method in &cred.auth_methods {
+                if let AuthMethod::Totp { secret, digits, period } = method {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    // Check current and adjacent time windows
+                    for offset in [-1i64, 0, 1] {
+                        let t = (now as i64 + offset * *period as i64) as u64;
+                        if generate_totp(secret, t, *digits, *period) == code {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn load_credentials(&mut self) -> Result<(), String> {
+        let vault_file = self.vault_path.join("vault.enc");
+        if !vault_file.exists() { return Ok(()); }
+
+        let encrypted = std::fs::read(&vault_file)
+            .map_err(|e| format!("Failed to read vault: {}", e))?;
+
+        if let Some(ref key) = self.master_key {
+            let _decrypted = key.decrypt(&encrypted)?;
+            // Deserialize credentials from JSON
+            // self.credentials = serde_json::from_slice(&decrypted)?;
+        }
+
+        Ok(())
+    }
+
+    fn save_vault(&self) -> Result<(), String> {
+        if let Some(ref key) = self.master_key {
+            // Serialize credentials to JSON
+            let json = b"{}"; // placeholder: serde_json::to_vec(&self.credentials)
+            let encrypted = key.encrypt(json);
+
+            std::fs::create_dir_all(&self.vault_path)
+                .map_err(|e| format!("Failed to create vault dir: {}", e))?;
+            std::fs::write(self.vault_path.join("vault.enc"), &encrypted)
+                .map_err(|e| format!("Failed to write vault: {}", e))?;
+        }
+        Ok(())
+    }
+}

@@ -65,10 +65,30 @@ echo "        → Load Temporary Add-on → select:"
 echo "        $PROFILE_DIR/extensions-src/nebula-privacy/manifest.json"
 echo ""
 
-# Launch Firefox with our hardened profile
-# --no-remote allows running alongside normal Firefox
-exec firefox \
-    --profile "$PROFILE_DIR" \
-    --no-remote \
-    --class NebulaBrowser \
-    "$@"
+# Launch — desktop vs Android/Termux
+if [ -n "$TERMUX_VERSION" ] || [ -d "/data/data/com.termux" ]; then
+    # Android: Firefox profile can't be passed via CLI — profile is synced above
+    echo "  [android] Profile synced to: $PROFILE_DIR"
+    echo "  [android] Import manually: Firefox → about:config"
+    echo "             or copy user.js to your Firefox profile folder."
+    echo ""
+    # Try launching Firefox for Android (Fenix or legacy)
+    if command -v am &>/dev/null; then
+        am start -a android.intent.action.VIEW \
+            -d "about:blank" \
+            -n org.mozilla.fenix/org.mozilla.fenix.HomeActivity 2>/dev/null \
+        || am start -a android.intent.action.VIEW \
+            -d "about:blank" \
+            -n org.mozilla.firefox/org.mozilla.gecko.BrowserApp 2>/dev/null \
+        || echo "  [android] Install Firefox (Fenix) from F-Droid, then re-run."
+    else
+        echo "  [android] Open Firefox manually — privacy profile is staged."
+    fi
+else
+    # Desktop — launch Firefox with our hardened profile
+    exec firefox \
+        --profile "$PROFILE_DIR" \
+        --no-remote \
+        --class NebulaBrowser \
+        "$@"
+fi

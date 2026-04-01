@@ -1,0 +1,334 @@
+// VOIDWEB — Ad Blocker Engine
+// Parses and applies uBlock Origin / AdBlock Plus filter lists.
+// Blocks ads, trackers, annoyances, and crypto miners.
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+
+/// Filter rule types
+#[derive(Debug, Clone)]
+pub enum FilterAction {
+    Block,
+    Allow,  // Exception rules (@@)
+}
+
+#[derive(Debug, Clone)]
+pub enum FilterType {
+    /// Domain-based blocking (||example.com^)
+    Domain(String),
+    /// URL pattern matching (*ads*)
+    Pattern(String),
+    /// Cosmetic filter (##.ad-banner)
+    Cosmetic { selector: String, domains: Option<Vec<String>> },
+    /// Scriptlet injection
+    Scriptlet { name: String, args: Vec<String> },
+}
+
+#[derive(Debug, Clone)]
+pub struct FilterRule {
+    pub raw: String,
+    pub action: FilterAction,
+    pub filter_type: FilterType,
+    pub options: FilterOptions,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FilterOptions {
+    pub third_party: Option<bool>,
+    pub resource_types: Vec<String>, // script, image, stylesheet, etc.
+    pub domains_include: Vec<String>,
+    pub domains_exclude: Vec<String>,
+}
+
+/// The main ad-blocking engine
+pub struct AdBlockEngine {
+    domain_blocks: HashSet<String>,
+    domain_allows: HashSet<String>,
+    pattern_blocks: Vec<(String, FilterOptions)>,
+    pattern_allows: Vec<(String, FilterOptions)>,
+    cosmetic_global: Vec<String>,       // Global CSS selectors to hide
+    cosmetic_site: HashMap<String, Vec<String>>, // Per-domain CSS selectors
+    stats: BlockStats,
+}
+
+#[derive(Debug, Default)]
+pub struct BlockStats {
+    pub total_blocked: u64,
+    pub ads_blocked: u64,
+    pub trackers_blocked: u64,
+    pub scripts_blocked: u64,
+    pub cosmetic_applied: u64,
+}
+
+/// Bundled filter lists — downloaded and cached locally
+pub const DEFAULT_FILTER_LISTS: &[(&str, &str)] = &[
+    ("EasyList", "https://easylist.to/easylist/easylist.txt"),
+    ("EasyPrivacy", "https://easylist.to/easylist/easyprivacy.txt"),
+    ("uBlock Filters", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"),
+    ("uBlock Badware", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt"),
+    ("uBlock Privacy", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt"),
+    ("uBlock Annoyances", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/annoyances-others.txt"),
+    ("Peter Lowe's List", "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&showintro=1&mimetype=plaintext"),
+    ("Fanboy Annoyances", "https://secure.fanboy.co.nz/fanboy-annoyance.txt"),
+    ("Fanboy Social", "https://easylist.to/easylist/fanboy-social.txt"),
+    ("Malware Domains", "https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-online.txt"),
+    ("CoinBlocker", "https://zerodot1.gitlab.io/CoinBlockerLists/list_browser.txt"),
+    ("Anti-Adblock Killer", "https://raw.githubusercontent.com/nickkk2/anti-adblock-killer/master/anti-adblock-killer-filters.txt"),
+];
+
+impl AdBlockEngine {
+    pub fn new() -> Self {
+        Self {
+            domain_blocks: HashSet::new(),
+            domain_allows: HashSet::new(),
+            pattern_blocks: Vec::new(),
+            pattern_allows: Vec::new(),
+            cosmetic_global: Vec::new(),
+            cosmetic_site: HashMap::new(),
+            stats: BlockStats::default(),
+        }
+    }
+
+    /// Load all default filter lists from cache directory
+    pub fn load_default_lists(&mut self, cache_dir: &Path) -> Result<usize, String> {
+        let mut total = 0;
+        for (name, _url) in DEFAULT_FILTER_LISTS {
+            let file = cache_dir.join(format!("{}.txt", name.replace(' ', "_")));
+            if file.exists() {
+                match fs::read_to_string(&file) {
+                    Ok(content) => {
+                        let count = self.parse_filter_list(&content);
+                        total += count;
+                        eprintln!("[adblock] Loaded {}: {} rules", name, count);
+                    }
+                    Err(e) => eprintln!("[adblock] Failed to read {}: {}", name, e),
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Parse a filter list (ABP/uBO format) and add rules
+    pub fn parse_filter_list(&mut self, content: &str) -> usize {
+        let mut count = 0;
+        for line in content.lines() {
+            let line = line.trim();
+            // Skip comments and metadata
+            if line.is_empty() || line.starts_with('!') || line.starts_with('[') {
+                continue;
+            }
+            if self.parse_rule(line) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn parse_rule(&mut self, line: &str) -> bool {
+        // Cosmetic filter: ##.ad-class or domain##.ad-class
+        if let Some(pos) = line.find("##") {
+            let domains_part = &line[..pos];
+            let selector = &line[pos + 2..];
+            if selector.is_empty() { return false; }
+
+            if domains_part.is_empty() {
+                self.cosmetic_global.push(selector.to_string());
+            } else {
+                for domain in domains_part.split(',') {
+                    let domain = domain.trim();
+                    if !domain.starts_with('~') {
+                        self.cosmetic_site
+                            .entry(domain.to_string())
+                            .or_default()
+                            .push(selector.to_string());
+                    }
+                }
+            }
+            return true;
+        }
+
+        // Exception rule: @@||example.com^
+        let (is_allow, rule_body) = if line.starts_with("@@") {
+            (true, &line[2..])
+        } else {
+            (false, line)
+        };
+
+        // Parse options after $
+        let (pattern, options) = if let Some(dollar) = rule_body.rfind('$') {
+            let opts_str = &rule_body[dollar + 1..];
+            let pattern = &rule_body[..dollar];
+            (pattern, Self::parse_options(opts_str))
+        } else {
+            (rule_body, FilterOptions::default())
+        };
+
+        // Domain rule: ||example.com^
+        if pattern.starts_with("||") && pattern.ends_with('^') {
+            let domain = &pattern[2..pattern.len() - 1];
+            if is_allow {
+                self.domain_allows.insert(domain.to_string());
+            } else {
+                self.domain_blocks.insert(domain.to_string());
+            }
+            return true;
+        }
+
+        // Generic URL pattern
+        if !pattern.is_empty() {
+            if is_allow {
+                self.pattern_allows.push((pattern.to_string(), options));
+            } else {
+                self.pattern_blocks.push((pattern.to_string(), options));
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn parse_options(opts: &str) -> FilterOptions {
+        let mut options = FilterOptions::default();
+        for opt in opts.split(',') {
+            let opt = opt.trim();
+            match opt {
+                "third-party" => options.third_party = Some(true),
+                "~third-party" | "first-party" => options.third_party = Some(false),
+                "script" | "image" | "stylesheet" | "font" | "media" |
+                "xmlhttprequest" | "websocket" | "popup" | "subdocument" => {
+                    options.resource_types.push(opt.to_string());
+                }
+                _ if opt.starts_with("domain=") => {
+                    let domains = &opt[7..];
+                    for d in domains.split('|') {
+                        if d.starts_with('~') {
+                            options.domains_exclude.push(d[1..].to_string());
+                        } else {
+                            options.domains_include.push(d.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        options
+    }
+
+    /// Check if a URL should be blocked
+    pub fn should_block(&mut self, url: &str, source_domain: &str, resource_type: &str) -> bool {
+        // Check domain allows first (exception rules)
+        for allowed in &self.domain_allows {
+            if url.contains(allowed.as_str()) {
+                return false;
+            }
+        }
+
+        // Check pattern allows
+        for (pattern, _opts) in &self.pattern_allows {
+            if Self::pattern_matches(url, pattern) {
+                return false;
+            }
+        }
+
+        // Check domain blocks
+        for blocked in &self.domain_blocks {
+            if url.contains(blocked.as_str()) {
+                self.stats.total_blocked += 1;
+                if resource_type == "script" {
+                    self.stats.scripts_blocked += 1;
+                } else {
+                    self.stats.ads_blocked += 1;
+                }
+                return true;
+            }
+        }
+
+        // Check pattern blocks
+        for (pattern, opts) in &self.pattern_blocks {
+            // Check third-party constraint
+            if let Some(tp) = opts.third_party {
+                let is_third_party = !url.contains(source_domain);
+                if tp != is_third_party { continue; }
+            }
+            // Check resource type constraint
+            if !opts.resource_types.is_empty() && !opts.resource_types.iter().any(|t| t == resource_type) {
+                continue;
+            }
+            if Self::pattern_matches(url, pattern) {
+                self.stats.total_blocked += 1;
+                self.stats.trackers_blocked += 1;
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Get cosmetic filters (CSS selectors to hide elements) for a domain
+    pub fn cosmetic_filters_for(&mut self, domain: &str) -> Vec<String> {
+        let mut selectors = self.cosmetic_global.clone();
+        if let Some(site_selectors) = self.cosmetic_site.get(domain) {
+            selectors.extend(site_selectors.iter().cloned());
+        }
+        self.stats.cosmetic_applied += selectors.len() as u64;
+        selectors
+    }
+
+    pub fn stats(&self) -> &BlockStats {
+        &self.stats
+    }
+
+    /// Simple wildcard pattern matching (* = any, ^ = separator)
+    fn pattern_matches(url: &str, pattern: &str) -> bool {
+        let parts: Vec<&str> = pattern.split('*').collect();
+        let mut pos = 0;
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() { continue; }
+            // Replace ^ with separator match (anything not alphanumeric or -._%)
+            let part = part.replace('^', "[^a-zA-Z0-9_.%-]");
+            if let Some(found) = url[pos..].find(&part) {
+                if i == 0 && found != 0 && !pattern.starts_with('*') {
+                    return false;
+                }
+                pos += found + part.len();
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_domain_block() {
+        let mut engine = AdBlockEngine::new();
+        engine.parse_filter_list("||doubleclick.net^\n||ads.example.com^\n");
+        assert!(engine.should_block("https://doubleclick.net/ad.js", "example.com", "script"));
+        assert!(!engine.should_block("https://example.com/page", "example.com", "document"));
+    }
+
+    #[test]
+    fn test_exception_rule() {
+        let mut engine = AdBlockEngine::new();
+        engine.parse_filter_list("||ads.example.com^\n@@||ads.example.com/safe^\n");
+        assert!(!engine.should_block("https://ads.example.com/safe/banner", "example.com", "image"));
+    }
+
+    #[test]
+    fn test_cosmetic_filter() {
+        let mut engine = AdBlockEngine::new();
+        engine.parse_filter_list("##.ad-banner\n##.sponsored\nexample.com##.site-ad\n");
+        let global = engine.cosmetic_filters_for("other.com");
+        assert!(global.contains(&".ad-banner".to_string()));
+        assert!(global.contains(&".sponsored".to_string()));
+        assert!(!global.contains(&".site-ad".to_string()));
+
+        let site = engine.cosmetic_filters_for("example.com");
+        assert!(site.contains(&".site-ad".to_string()));
+    }
+}

@@ -1,379 +1,471 @@
-//! VOIDWEB — Native benchmark suite
-//!
-//! Micro-benchmarks for every hot subsystem:
-//!   - KV cache alloc / free / prefix lookup
-//!   - RadixCache insert / lookup / eviction
-//!   - Sampler (greedy, top-k, top-p) throughput
-//!   - Tokenizer encode / decode
-//!   - Scheduler schedule_batch / commit_step
-//!   - Rolling hash throughput
-//!   - Arena alloc / reset
-//!   - Ring buffer push / pop (SPSC + MPMC)
-//!
-//! Run via:   bmc bench bench/bench.bm
-//! Output:    human-readable table + bench_native.json
-//!
-//! — measurement or terminus. no claims without numbers.
+/// VOIDWEB Benchmark Runner
+///
+/// Async HTTP benchmark against all inference engines.
+/// Measures TTFT, ITL, throughput, VRAM.
+///
+/// Build:  rustc -O --edition 2021 bench.rs -o bench_runner
+///         (or add to Cargo workspace)
+///
+/// Usage:
+///   ./bench_runner
+///   ./bench_runner --engines oracle vllm
+///   ./bench_runner --concurrency 1 8 32 --requests 50
+///   ./bench_runner --prompt-len 512 --output-len 256
+///   ./bench_runner --quick
+///
+/// Engines default to localhost ports — override via env:
+///   ORACLE_PORT=8000 VLLM_PORT=8001 ./bench_runner
 
-use std::time
-use std::io
-use std::json
-use std::collections::HashMap
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use engine::kv_cache::{BlockManager, BlockId}
-use radix_cache::RadixCacheManager
-use sampler::{Sampler, SamplerConfig}
-use scheduler::{Scheduler, SamplingParams, BatchView}
-use tokenizer::Tokenizer
-use utils::arena::Arena
-use utils::ring::{SpscRing, MpmcRing}
+// ── Engine registry ──────────────────────────────────────────────────────────
 
-// ── Bench harness ─────────────────────────────────────────────────────────────
+#[derive(Debug, Clone)]
+struct Engine {
+    key:   &'static str,
+    name:  &'static str,
+    port:  u16,
+    notes: &'static str,
+}
 
-const WARMUP_ITERS: usize = 200
-const BENCH_ITERS:  usize = 2000
+const ENGINES: &[Engine] = &[
+    Engine { key: "oracle",        name: "OracleInference",   port: 8000, notes: "BlackMagic, RadixAttention" },
+    Engine { key: "oracle_radix",  name: "Oracle+RadixCache", port: 8005, notes: "Oracle + prefix cache" },
+    Engine { key: "vllm",          name: "vLLM",              port: 8001, notes: "PagedAttention" },
+    Engine { key: "tensorrt",      name: "TensorRT-LLM",      port: 8002, notes: "Inflight batching" },
+    Engine { key: "sglang",        name: "SGLang",            port: 8003, notes: "RadixAttention" },
+    Engine { key: "llamacpp",      name: "llama.cpp",         port: 8004, notes: "GGUF, CPU+GPU" },
+];
 
-/// Run `f` for `iters` iterations and return mean nanoseconds per iteration.
-fn bench_ns<F: fn() -> void>(name: str, iters: usize, f: F) -> BenchRow {
-    // warmup — no measurement. let the node stabilise.
-    for _ in 0..WARMUP_ITERS { f() }
+fn engine_port(key: &str, default: u16) -> u16 {
+    let var = format!("{}_PORT", key.to_uppercase().replace('-', "_"));
+    env::var(&var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
 
-    let t0 = time::now_nanos()
-    for _ in 0..iters { f() }
-    let elapsed = time::now_nanos() - t0
+// ── Result types ─────────────────────────────────────────────────────────────
 
-    let ns_per_iter = elapsed / iters as u64
-    let ops_per_sec = if ns_per_iter > 0 {
-        1_000_000_000u64 / ns_per_iter
-    } else {
-        0
-    }
-
-    BenchRow { name: name.to_owned(), iters, ns_per_iter, ops_per_sec }
+#[derive(Debug, Clone)]
+struct SingleResult {
+    ttft_ms:       f64,
+    total_ms:      f64,
+    output_tokens: usize,
+    itl_ms:        f64,
+    failed:        bool,
+    error:         String,
 }
 
 #[derive(Debug, Clone)]
-pub struct BenchRow {
-    pub name:        str,
-    pub iters:       usize,
-    pub ns_per_iter: u64,
-    pub ops_per_sec: u64,
+struct BenchResult {
+    engine_key:    String,
+    engine_name:   String,
+    concurrency:   usize,
+    prompt_tokens: usize,
+    output_tokens: usize,
+    samples:       Vec<SingleResult>,
+    ttft_p50:      f64,
+    ttft_p95:      f64,
+    itl_p50:       f64,
+    itl_p95:       f64,
+    throughput:    f64,
+    success_rate:  f64,
+    vram_mib:      u64,
 }
 
-impl BenchRow {
-    fn print(self: &BenchRow) {
-        let ns = self.ns_per_iter
-        let ops = self.ops_per_sec
-        let unit = if ops >= 1_000_000 {
-            format!("{:.2}M ops/s", ops as f64 / 1_000_000.0)
-        } else if ops >= 1_000 {
-            format!("{:.1}K ops/s", ops as f64 / 1_000.0)
-        } else {
-            format!("{ops} ops/s")
+impl BenchResult {
+    fn compute(&mut self, wall_secs: f64) {
+        let good: Vec<&SingleResult> = self.samples.iter().filter(|s| !s.failed).collect();
+        if good.is_empty() { return; }
+
+        let mut ttfts: Vec<f64> = good.iter().map(|s| s.ttft_ms).collect();
+        let mut itls:  Vec<f64> = good.iter().filter(|s| s.output_tokens > 1).map(|s| s.itl_ms).collect();
+        let total_out: usize    = good.iter().map(|s| s.output_tokens).sum();
+
+        ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        itls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        self.ttft_p50    = percentile(&ttfts, 50);
+        self.ttft_p95    = percentile(&ttfts, 95);
+        self.itl_p50     = percentile(&itls,  50);
+        self.itl_p95     = percentile(&itls,  95);
+        self.throughput  = if wall_secs > 0.0 { total_out as f64 / wall_secs } else { 0.0 };
+        self.success_rate = good.len() as f64 / self.samples.len() as f64 * 100.0;
+    }
+}
+
+fn percentile(data: &[f64], pct: usize) -> f64 {
+    if data.is_empty() { return 0.0; }
+    let k = (data.len() - 1) as f64 * pct as f64 / 100.0;
+    let lo = k as usize;
+    let hi = (lo + 1).min(data.len() - 1);
+    data[lo] + (data[hi] - data[lo]) * (k - lo as f64)
+}
+
+// ── VRAM ──────────────────────────────────────────────────────────────────────
+
+fn sample_vram() -> u64 {
+    std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.lines().filter_map(|l| l.trim().parse::<u64>().ok()).sum())
+        .unwrap_or(0)
+}
+
+// ── Minimal sync HTTP client (no external deps) ───────────────────────────────
+
+fn ping(host: &str, port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &format!("{host}:{port}").parse().unwrap(),
+        Duration::from_secs(3),
+    ).is_ok()
+}
+
+/// Send a streaming chat/completions request, measure TTFT and token count.
+/// Returns (ttft_ms, total_ms, token_count, error).
+fn stream_request(
+    host:          &str,
+    port:          u16,
+    model:         &str,
+    prompt_tokens: usize,
+    max_tokens:    usize,
+) -> SingleResult {
+    let content = build_prompt(prompt_tokens);
+    let body = format!(
+        r#"{{"model":"{model}","messages":[{{"role":"user","content":"{content}"}}],"max_tokens":{max_tokens},"stream":true,"temperature":0.0}}"#,
+    );
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+        len = body.len(),
+    );
+
+    let t0 = Instant::now();
+
+    let stream = match TcpStream::connect_timeout(
+        &format!("{host}:{port}").parse().unwrap(),
+        Duration::from_secs(5),
+    ) {
+        Ok(s) => s,
+        Err(e) => return SingleResult { ttft_ms: 0.0, total_ms: 0.0, output_tokens: 0, itl_ms: 0.0, failed: true, error: e.to_string() },
+    };
+
+    stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
+
+    use std::io::Write;
+    if let Err(e) = (&stream).write_all(req.as_bytes()) {
+        return SingleResult { ttft_ms: 0.0, total_ms: 0.0, output_tokens: 0, itl_ms: 0.0, failed: true, error: e.to_string() };
+    }
+
+    let mut reader     = BufReader::new(&stream);
+    let mut in_body    = false;
+    let mut token_count = 0usize;
+    let mut ttft_ms    = 0.0f64;
+    let mut line       = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
-        println!("  {:<42} {:>8} ns/op   {}", self.name, ns, unit)
-    }
-}
 
-// ── KV cache benchmarks ───────────────────────────────────────────────────────
-
-fn bench_kv_cache() -> Vec<BenchRow> {
-    let mut rows: Vec<BenchRow> = Vec::new()
-
-    // alloc single block
-    rows.push(bench_ns("kv_cache::alloc (single block)", BENCH_ITERS, fn() {
-        let mut mgr = BlockManager::new(32, 8, 128, 16, 4096)
-        mgr.alloc()
-    }))
-
-    // alloc_seq 16 blocks
-    rows.push(bench_ns("kv_cache::alloc_seq (16 blocks)", BENCH_ITERS, fn() {
-        let mut mgr = BlockManager::new(32, 8, 128, 16, 4096)
-        let _ = mgr.alloc_seq(16)
-    }))
-
-    // free_seq 16 blocks
-    rows.push(bench_ns("kv_cache::free_seq (16 blocks)", BENCH_ITERS, fn() {
-        let mut mgr = BlockManager::new(32, 8, 128, 16, 4096)
-        let ids = mgr.alloc_seq(16).unwrap()
-        mgr.free_seq(&ids)
-    }))
-
-    // prefix_lookup (16-block chain)
-    {
-        let mut mgr  = BlockManager::new(32, 8, 128, 16, 4096)
-        let tokens: Vec<u32> = (0u32..256).collect()
-        let ids    = mgr.alloc_seq(16).unwrap()
-        var hash: u64 = 0
-        for (i, chunk) in tokens.chunks(16).enumerate() {
-            hash = rolling_hash_bench(hash, chunk)
-            mgr.register_prefix_block(ids[i], hash)
+        if !in_body {
+            if line == "\r\n" { in_body = true; }
+            continue;
         }
-        rows.push(bench_ns("kv_cache::prefix_lookup (16-block prefix)", BENCH_ITERS, fn() {
-            mgr.prefix_lookup(&tokens)
-        }))
-    }
 
-    rows
-}
+        let l = line.trim();
+        if !l.starts_with("data:") { continue; }
+        let data = l[5..].trim();
+        if data == "[DONE]" { break; }
 
-// ── RadixCache benchmarks ─────────────────────────────────────────────────────
-
-fn bench_radix_cache() -> Vec<BenchRow> {
-    let mut rows: Vec<BenchRow> = Vec::new()
-
-    let tokens_256: Vec<u32>  = (0u32..256).collect()
-    let blocks_16:  Vec<u32>  = (0u32..16).collect()
-
-    // insert
-    rows.push(bench_ns("radix_cache::insert (256 tokens, 16 blocks)", BENCH_ITERS, fn() {
-        let mut cache = RadixCacheManager::new(16, 65536)
-        cache.insert(&tokens_256, &blocks_16)
-    }))
-
-    // lookup hit
-    {
-        let mut cache = RadixCacheManager::new(16, 65536)
-        cache.insert(&tokens_256, &blocks_16)
-        rows.push(bench_ns("radix_cache::lookup (full hit, 256 tokens)", BENCH_ITERS, fn() {
-            cache.lookup(&tokens_256)
-        }))
-    }
-
-    // lookup miss
-    {
-        let cache = RadixCacheManager::new(16, 65536)
-        rows.push(bench_ns("radix_cache::lookup (cold miss)", BENCH_ITERS, fn() {
-            cache.lookup(&tokens_256)
-        }))
-    }
-
-    // evict_one
-    {
-        let mut cache = RadixCacheManager::new(16, 16)   // tight cap to force eviction
-        for i in 0u32..8 {
-            let toks: Vec<u32> = (i*32..(i+1)*32).collect()
-            let blks: Vec<u32> = (i*2..(i+1)*2).collect()
-            cache.insert(&toks, &blks)
-        }
-        rows.push(bench_ns("radix_cache::evict_lru (1 leaf)", BENCH_ITERS, fn() {
-            cache.evict_lru(1)
-        }))
-    }
-
-    rows
-}
-
-// ── Sampler benchmarks ────────────────────────────────────────────────────────
-
-fn bench_sampler() -> Vec<BenchRow> {
-    let mut rows: Vec<BenchRow> = Vec::new()
-    let vocab: usize = 32000
-
-    let logits: Vec<f32> = (0u32..vocab as u32).map(fn(i) i as f32 * 0.001).collect()
-    let prev:   Vec<u32> = vec![1u32, 2, 3, 4, 5]
-
-    // greedy (temp=0)
-    {
-        let cfg = SamplerConfig { temperature: 0.0, top_p: 1.0, top_k: 0, repetition_penalty: 1.0 }
-        let s   = Sampler::new(cfg)
-        rows.push(bench_ns("sampler::greedy (vocab=32k)", BENCH_ITERS, fn() {
-            sample_one_bench(&s.config, &logits, &prev)
-        }))
-    }
-
-    // temperature + top-k=50
-    {
-        let cfg = SamplerConfig { temperature: 0.7, top_p: 1.0, top_k: 50, repetition_penalty: 1.0 }
-        let s   = Sampler::new(cfg)
-        rows.push(bench_ns("sampler::temp+top_k50 (vocab=32k)", BENCH_ITERS, fn() {
-            sample_one_bench(&s.config, &logits, &prev)
-        }))
-    }
-
-    // temperature + top-p=0.95
-    {
-        let cfg = SamplerConfig { temperature: 0.7, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 }
-        let s   = Sampler::new(cfg)
-        rows.push(bench_ns("sampler::temp+top_p0.95 (vocab=32k)", BENCH_ITERS, fn() {
-            sample_one_bench(&s.config, &logits, &prev)
-        }))
-    }
-
-    rows
-}
-
-// ── Scheduler benchmarks ──────────────────────────────────────────────────────
-
-fn bench_scheduler() -> Vec<BenchRow> {
-    let mut rows: Vec<BenchRow> = Vec::new()
-
-    // add_request
-    rows.push(bench_ns("scheduler::add_request", BENCH_ITERS, fn() {
-        let mut s = Scheduler::new(8192, 8192, 256)
-        s.add_request(vec![1u32, 2, 3, 4, 5], SamplingParams::default())
-    }))
-
-    // schedule_batch (32 running decode seqs)
-    {
-        let mut s = Scheduler::new(8192, 8192, 256)
-        for _ in 0..32 {
-            s.add_request((0u32..64).collect(), SamplingParams::default())
-        }
-        // promote all to decoding
-        for _ in 0..4 { s.schedule_batch() }
-        rows.push(bench_ns("scheduler::schedule_batch (32 decode seqs)", BENCH_ITERS, fn() {
-            s.schedule_batch()
-        }))
-    }
-
-    rows
-}
-
-// ── Arena benchmarks ──────────────────────────────────────────────────────────
-
-fn bench_arena() -> Vec<BenchRow> {
-    let mut rows: Vec<BenchRow> = Vec::new()
-
-    // alloc + reset cycle
-    rows.push(bench_ns("arena::alloc_raw (64 bytes) + reset", BENCH_ITERS, fn() {
-        let mut a = Arena::new(4096)
-        a.alloc_raw(64, 16)
-        a.reset()
-        a.destroy()
-    }))
-
-    // 100 allocs then reset
-    rows.push(bench_ns("arena::100× alloc_raw (64B) + reset", BENCH_ITERS, fn() {
-        let mut a = Arena::new(64 * 128)
-        for _ in 0..100 { a.alloc_raw(64, 16) }
-        a.reset()
-        a.destroy()
-    }))
-
-    rows
-}
-
-// ── Ring buffer benchmarks ────────────────────────────────────────────────────
-
-fn bench_ring() -> Vec<BenchRow> {
-    let mut rows: Vec<BenchRow> = Vec::new()
-
-    // SPSC push+pop round-trip
-    rows.push(bench_ns("ring::SpscRing<u32,256> push+pop", BENCH_ITERS, fn() {
-        let ring: SpscRing<u32, 256> = SpscRing::new()
-        ring.push(42u32)
-        ring.pop()
-    }))
-
-    // MPMC push+pop round-trip
-    rows.push(bench_ns("ring::MpmcRing<u32,4096> push+pop", BENCH_ITERS, fn() {
-        let ring: MpmcRing<u32, 4096> = MpmcRing::new()
-        ring.push(42u32)
-        ring.pop()
-    }))
-
-    rows
-}
-
-// ── Rolling hash benchmark ────────────────────────────────────────────────────
-
-fn bench_hash() -> Vec<BenchRow> {
-    let mut rows: Vec<BenchRow> = Vec::new()
-    let tokens: Vec<u32> = (0u32..16).collect()
-
-    rows.push(bench_ns("rolling_hash (16 tokens)", BENCH_ITERS, fn() {
-        rolling_hash_bench(0, &tokens)
-    }))
-
-    rows
-}
-
-// Inline copy of rolling_hash to avoid cross-module dep in bench binary.
-pure fn rolling_hash_bench(prev: u64, tokens: &[u32]) -> u64 {
-    const P: u64 = 0x9e37_79b9_7f4a_7c15
-    var h: u64 = prev.wrapping_add(tokens.len() as u64 * P)
-    for &t in tokens {
-        h = h.wrapping_mul(P).wrapping_add(t as u64)
-    }
-    h
-}
-
-// Inline sample_one for bench without !Rand effect in bench binary.
-fn sample_one_bench(cfg: &sampler::SamplerConfig, logits: &[f32], prev: &[u32]) -> u32 {
-    var scores: Vec<f32> = logits.to_vec()
-    if (cfg.repetition_penalty - 1.0).abs() > 1e-6f32 {
-        for &t in prev {
-            let idx = t as usize
-            if idx < scores.len() {
-                scores[idx] = if scores[idx] < 0.0 { scores[idx] * cfg.repetition_penalty }
-                              else                  { scores[idx] / cfg.repetition_penalty }
+        // Count content tokens by checking "content":" in chunk
+        if data.contains(r#""content":""#) || (data.contains(r#""content":"#) && !data.contains(r#""content":null"#)) {
+            token_count += 1;
+            if ttft_ms == 0.0 {
+                ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
             }
         }
     }
-    if cfg.temperature <= 0.0 {
-        var best_i: usize = 0
-        var best_v: f32   = f32::NEG_INFINITY
-        for (i, &v) in scores.iter().enumerate() { if v > best_v { best_v = v; best_i = i } }
-        return best_i as u32
-    }
-    // simplified: just return argmax after temperature scale for bench timing
-    let inv_t = 1.0 / cfg.temperature
-    for s in scores.iter_mut() { s *= inv_t }
-    var best_i: usize = 0
-    var best_v: f32   = f32::NEG_INFINITY
-    for (i, &v) in scores.iter().enumerate() { if v > best_v { best_v = v; best_i = i } }
-    best_i as u32
+
+    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let itl = if token_count > 1 { (total_ms - ttft_ms) / (token_count - 1) as f64 } else { 0.0 };
+
+    SingleResult { ttft_ms, total_ms, output_tokens: token_count, itl_ms: itl, failed: false, error: String::new() }
 }
 
-// ── Output ────────────────────────────────────────────────────────────────────
-
-fn save_json(all_rows: &[BenchRow], path: str) !IO {
-    let mut arr: Vec<json::Value> = Vec::new()
-    for r in all_rows {
-        arr.push(json::object([
-            ("name",        json::str(r.name)),
-            ("iters",       json::u64(r.iters as u64)),
-            ("ns_per_iter", json::u64(r.ns_per_iter)),
-            ("ops_per_sec", json::u64(r.ops_per_sec)),
-        ]))
-    }
-    let s = json::to_str(json::array(arr))
-    std::fs::write(path, s.as_bytes())?
-    println!("  Results → {path}")
+fn build_prompt(tokens: usize) -> String {
+    let long = "Explain in detail. Provide a thorough multi-paragraph response covering history, applications, and future directions. Topic: quantum computing. ";
+    let chars = tokens * 4;
+    long.repeat((chars / long.len()) + 1)[..chars.min(long.len() * 20)].replace('"', "'")
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+fn detect_model(host: &str, port: u16) -> String {
+    let req = format!(
+        "GET /v1/models HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    );
+    let Ok(stream) = TcpStream::connect_timeout(
+        &format!("{host}:{port}").parse().unwrap(),
+        Duration::from_secs(3),
+    ) else { return "unknown".into(); };
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    use std::io::Write;
+    let _ = (&stream).write_all(req.as_bytes());
+    let mut r = BufReader::new(&stream);
+    let mut body = String::new();
+    let mut in_b = false;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if r.read_line(&mut line).unwrap_or(0) == 0 { break; }
+        if !in_b { if line == "\r\n" { in_b = true; } continue; }
+        body.push_str(&line);
+    }
+    // naive: find first "id":"..." after "data"
+    if let Some(i) = body.find("\"id\":\"") {
+        let s = &body[i + 6..];
+        if let Some(j) = s.find('"') {
+            return s[..j].to_owned();
+        }
+    }
+    "unknown".into()
+}
 
-fn main() -> void !IO {
-    println!("══════════════════════════════════════════════════════")
-    println!("  VOIDWEB Native Benchmark  (iters={})", BENCH_ITERS)
-    println!("══════════════════════════════════════════════════════")
+// ── Bench runner ─────────────────────────────────────────────────────────────
 
-    let mut all: Vec<BenchRow> = Vec::new()
+fn run_concurrency(
+    host:          &str,
+    port:          u16,
+    model:         &str,
+    concurrency:   usize,
+    num_requests:  usize,
+    prompt_tokens: usize,
+    output_tokens: usize,
+) -> (Vec<SingleResult>, f64) {
+    let results: Arc<Mutex<Vec<SingleResult>>> = Arc::new(Mutex::new(Vec::new()));
+    let sem: Arc<Mutex<usize>>                 = Arc::new(Mutex::new(concurrency));
 
-    println!("\n  ── KV Cache ──────────────────────────────────────")
-    for r in bench_kv_cache()   { r.print(); all.push(r) }
+    let t0 = Instant::now();
+    let mut handles = Vec::new();
 
-    println!("\n  ── RadixCache ────────────────────────────────────")
-    for r in bench_radix_cache() { r.print(); all.push(r) }
+    for _ in 0..num_requests {
+        // acquire slot
+        loop {
+            let mut s = sem.lock().unwrap();
+            if *s > 0 { *s -= 1; break; }
+            drop(s);
+            thread::sleep(Duration::from_millis(1));
+        }
 
-    println!("\n  ── Sampler ───────────────────────────────────────")
-    for r in bench_sampler()    { r.print(); all.push(r) }
+        let res_clone  = Arc::clone(&results);
+        let sem_clone  = Arc::clone(&sem);
+        let host       = host.to_owned();
+        let model      = model.to_owned();
 
-    println!("\n  ── Scheduler ─────────────────────────────────────")
-    for r in bench_scheduler()  { r.print(); all.push(r) }
+        handles.push(thread::spawn(move || {
+            let r = stream_request(&host, port, &model, prompt_tokens, output_tokens);
+            res_clone.lock().unwrap().push(r);
+            *sem_clone.lock().unwrap() += 1;
+        }));
+    }
 
-    println!("\n  ── Arena ─────────────────────────────────────────")
-    for r in bench_arena()      { r.print(); all.push(r) }
+    for h in handles { let _ = h.join(); }
 
-    println!("\n  ── Ring Buffers ──────────────────────────────────")
-    for r in bench_ring()       { r.print(); all.push(r) }
+    let wall = t0.elapsed().as_secs_f64();
+    let out  = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+    (out, wall)
+}
 
-    println!("\n  ── Hashing ───────────────────────────────────────")
-    for r in bench_hash()       { r.print(); all.push(r) }
+// ── Report ────────────────────────────────────────────────────────────────────
 
-    println!("\n══════════════════════════════════════════════════════\n")
+fn bar(value: f64, max: f64, width: usize) -> String {
+    if max <= 0.0 { return "░".repeat(width); }
+    let filled = ((value / max * width as f64).round() as usize).max(1).min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
 
-    save_json(&all, "bench_native.json")
+fn print_report(all: &HashMap<String, HashMap<usize, BenchResult>>, levels: &[usize]) {
+    println!("\n{}", "═".repeat(88));
+    println!("  ORACLE INFERENCE — BENCHMARK REPORT");
+    println!("{}", "═".repeat(88));
+
+    for &conc in levels {
+        println!("\n  Concurrency = {conc}");
+        println!("  {:<20} {:>12} {:>10} {:>10} {:>9} {:>9} {:>5} {:>8}",
+            "Engine", "Tput tok/s", "TTFT p50", "TTFT p95", "ITL p50", "ITL p95", "OK%", "VRAM");
+        println!("  {}", "─".repeat(86));
+
+        let mut rows: Vec<(&str, &BenchResult)> = all.iter()
+            .filter_map(|(k, by_c)| by_c.get(&conc).map(|br| (k.as_str(), br)))
+            .collect();
+        rows.sort_by(|a, b| b.1.throughput.partial_cmp(&a.1.throughput).unwrap());
+
+        let max_tput = rows.iter().map(|(_, b)| b.throughput).fold(0.0f64, f64::max);
+
+        for (i, (_, br)) in rows.iter().enumerate() {
+            let medal = ["[1]", "[2]", "[3]", "   ", "   "].get(i).unwrap_or(&"   ");
+            let vram  = if br.vram_mib > 0 { format!("{} MiB", br.vram_mib) } else { "  —".into() };
+            println!("  {medal} {:<18} {:>11.1}  {:>9.0}ms {:>9.0}ms {:>8.2}ms {:>8.2}ms {:>4.0}% {:>8}",
+                br.engine_name, br.throughput,
+                br.ttft_p50, br.ttft_p95,
+                br.itl_p50, br.itl_p95,
+                br.success_rate, vram);
+        }
+
+        println!("\n  Throughput (concurrency={conc}):");
+        for (_, br) in &rows {
+            let b = bar(br.throughput, max_tput, 28);
+            println!("  {:<20} {b}  {:.1} tok/s", br.engine_name, br.throughput);
+        }
+    }
+
+    println!("\n{}", "─".repeat(88));
+    println!("  WINNER BY CATEGORY");
+    println!("{}", "─".repeat(88));
+
+    let all_brs: Vec<&BenchResult> = all.values().flat_map(|m| m.values()).collect();
+    if let Some(b) = all_brs.iter().max_by(|a, b| a.throughput.partial_cmp(&b.throughput).unwrap()) {
+        println!("  [tput]  {}  {:.1} tok/s", b.engine_name, b.throughput);
+    }
+    if let Some(b) = all_brs.iter().filter(|b| b.ttft_p50 > 0.0).min_by(|a, b| a.ttft_p50.partial_cmp(&b.ttft_p50).unwrap()) {
+        println!("  [ttft]  {}  {:.0} ms p50", b.engine_name, b.ttft_p50);
+    }
+    if let Some(b) = all_brs.iter().filter(|b| b.itl_p50 > 0.0).min_by(|a, b| a.itl_p50.partial_cmp(&b.itl_p50).unwrap()) {
+        println!("  [itl]   {}  {:.2} ms/tok p50", b.engine_name, b.itl_p50);
+    }
+    println!("{}\n", "═".repeat(88));
+}
+
+fn save_json(all: &HashMap<String, HashMap<usize, BenchResult>>, path: &str) {
+    let mut out = String::from("{\n");
+    let mut eng_first = true;
+    for (key, by_conc) in all {
+        if !eng_first { out.push_str(",\n"); }
+        eng_first = false;
+        out.push_str(&format!("  \"{key}\": {{\n"));
+        let mut conc_first = true;
+        let mut sorted: Vec<(&usize, &BenchResult)> = by_conc.iter().collect();
+        sorted.sort_by_key(|(c, _)| *c);
+        for (conc, br) in sorted {
+            if !conc_first { out.push_str(",\n"); }
+            conc_first = false;
+            out.push_str(&format!(
+                "    \"{conc}\": {{\"engine\":\"{}\",\"throughput\":{:.2},\"ttft_p50_ms\":{:.2},\"ttft_p95_ms\":{:.2},\"itl_p50_ms\":{:.3},\"itl_p95_ms\":{:.3},\"success_rate\":{:.1},\"vram_mib\":{}}}",
+                br.engine_name, br.throughput, br.ttft_p50, br.ttft_p95, br.itl_p50, br.itl_p95, br.success_rate, br.vram_mib,
+            ));
+        }
+        out.push_str("\n  }");
+    }
+    out.push_str("\n}\n");
+    fs::write(path, out).unwrap_or_else(|e| eprintln!("  save failed: {e}"));
+    println!("  Results → {path}");
+}
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    let mut engine_filter: Vec<String> = Vec::new();
+    let mut concurrency  = vec![1usize, 4, 16];
+    let mut num_requests = 50usize;
+    let mut prompt_len   = 256usize;
+    let mut output_len   = 128usize;
+    let mut out_path     = "bench_results.json".to_owned();
+    let mut quick        = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--engines"     => { i += 1; while i < args.len() && !args[i].starts_with('-') { engine_filter.push(args[i].clone()); i += 1; } }
+            "--concurrency" => { concurrency.clear(); i += 1; while i < args.len() && !args[i].starts_with('-') { if let Ok(n) = args[i].parse() { concurrency.push(n); } i += 1; } }
+            "--requests"    => { i += 1; if i < args.len() { num_requests = args[i].parse().unwrap_or(50); i += 1; } }
+            "--prompt-len"  => { i += 1; if i < args.len() { prompt_len   = args[i].parse().unwrap_or(256); i += 1; } }
+            "--output-len"  => { i += 1; if i < args.len() { output_len   = args[i].parse().unwrap_or(128); i += 1; } }
+            "--out"         => { i += 1; if i < args.len() { out_path     = args[i].clone(); i += 1; } }
+            "--quick"       => { quick = true; i += 1; }
+            _ => { i += 1; }
+        }
+    }
+
+    if quick { num_requests = 10; concurrency = vec![1, 4]; }
+
+    let engines: Vec<&Engine> = ENGINES.iter()
+        .filter(|e| engine_filter.is_empty() || engine_filter.iter().any(|f| f == e.key))
+        .collect();
+
+    println!("\n{}", "═".repeat(60));
+    println!("  VOIDWEB Benchmark Runner (Rust)");
+    println!("{}", "═".repeat(60));
+    println!("  Engines:     {}", engines.iter().map(|e| e.key).collect::<Vec<_>>().join(", "));
+    println!("  Concurrency: {concurrency:?}");
+    println!("  Requests:    {num_requests} per level");
+    println!("  Prompt len:  ~{prompt_len} tokens");
+    println!("  Output len:  {output_len} tokens max\n");
+
+    let mut all: HashMap<String, HashMap<usize, BenchResult>> = HashMap::new();
+    let host = "127.0.0.1";
+
+    for eng in &engines {
+        let port = engine_port(eng.key, eng.port);
+        println!("{}  port={port}", eng.name);
+
+        if !ping(host, port) {
+            println!("  [skip] not reachable at {host}:{port}");
+            continue;
+        }
+
+        let model = detect_model(host, port);
+        println!("  model={model}");
+
+        let eng_results = all.entry(eng.key.to_owned()).or_default();
+
+        for &conc in &concurrency {
+            print!("  conc={conc}  requests={num_requests} ... ");
+
+            let vram_before = sample_vram();
+            let (samples, wall) = run_concurrency(host, port, &model, conc, num_requests, prompt_len, output_len);
+            let vram_after = sample_vram();
+
+            let good = samples.iter().filter(|s| !s.failed).count();
+            let mut br = BenchResult {
+                engine_key:    eng.key.to_owned(),
+                engine_name:   eng.name.to_owned(),
+                concurrency:   conc,
+                prompt_tokens: prompt_len,
+                output_tokens: output_len,
+                samples,
+                ttft_p50:      0.0,
+                ttft_p95:      0.0,
+                itl_p50:       0.0,
+                itl_p95:       0.0,
+                throughput:    0.0,
+                success_rate:  0.0,
+                vram_mib:      vram_after.saturating_sub(vram_before),
+            };
+            br.compute(wall);
+            println!("{good}/{num_requests} ok  tput={:.1} tok/s  TTFT p50={:.0}ms  ITL p50={:.2}ms/tok",
+                br.throughput, br.ttft_p50, br.itl_p50);
+
+            eng_results.insert(conc, br);
+        }
+    }
+
+    if all.is_empty() {
+        eprintln!("No engines responded.");
+        std::process::exit(1);
+    }
+
+    print_report(&all, &concurrency);
+    save_json(&all, &out_path);
 }

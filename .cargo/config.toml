@@ -1,5 +1,6 @@
 [build]
-jobs = 0
+# 6 of 8 cores — leaves headroom to avoid OOM on Android
+jobs = 6
 
 [target.aarch64-linux-android]
 rustflags = ["-C", "target-cpu=cortex-x4", "-C", "target-feature=+sve2,+dotprod,+fp16fml", "-C", "opt-level=3"]

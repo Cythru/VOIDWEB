@@ -7,7 +7,7 @@ license = "GPL-3.0"
 
 [lib]
 name = "nebula"
-path = "lib.rs"
+path = "lib.bm"
 
 # Rust components: networking, security, ad blocking, Tor, VoidShield
 [dependencies]
