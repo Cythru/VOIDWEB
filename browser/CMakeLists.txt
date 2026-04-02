@@ -50,9 +50,6 @@ if(ZIG)
     add_dependencies(nebula-browser nebula-zig)
 endif()
 
-# --- CEF (Chromium Embedded Framework) ---
-# find_package(CEF REQUIRED)
-# target_link_libraries(nebula-browser PRIVATE CEF::CEF)
 
 # --- Compile flags ---
 target_compile_options(nebula-browser PRIVATE

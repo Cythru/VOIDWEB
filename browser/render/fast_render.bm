@@ -1,6 +1,6 @@
 // NebulaBrowser — High-Performance Rendering Pipeline (Zig)
 // Zero-copy, SIMD-accelerated HTML/CSS processing for maximum speed.
-// Works alongside CEF but handles pre-processing, caching, and resource optimization.
+// Works alongside GeckoView but handles pre-processing, caching, and resource optimization.
 
 const std = @import("std");
 

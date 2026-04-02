@@ -3,6 +3,38 @@
 
 const std = @import("std");
 
+/// W3m mode — text-first rendering pipeline
+/// ON by default for text content. OFF for media.
+/// HTML pages fetched via w3m before GeckoView. Zero JS overhead. Perfect for agent use.
+pub const W3mConfig = struct {
+    enabled:           bool   = true,   // master toggle
+    route_html:        bool   = true,   // text/html → w3m
+    route_plaintext:   bool   = true,   // text/plain → w3m
+    route_images:      bool   = false,  // images → GeckoView full render
+    route_video:       bool   = false,  // video  → GeckoView full render
+    route_audio:       bool   = false,  // audio  → GeckoView full render
+    route_javascript:  bool   = false,  // JS pages → GeckoView full render
+    dump_mode:         bool   = true,   // dump text, no interactive
+    cookie_accept:     bool   = false,
+    max_output_bytes:  usize  = 512 * 1024,  // 512 KB cap
+    w3m_bin:           ?[]const u8 = null,   // auto-detect if null
+};
+
+pub const default_w3m_config = W3mConfig{};
+
+pub fn should_use_w3m(resource_type: ResourceType, cfg: W3mConfig) bool {
+    if (!cfg.enabled) return false;
+    return switch (resource_type) {
+        .html       => cfg.route_html,
+        .css        => false,
+        .javascript => cfg.route_javascript,
+        .image      => cfg.route_images,
+        .video      => cfg.route_video,
+        .audio      => cfg.route_audio,
+        .other      => false,
+    };
+}
+
 /// Browser version
 pub const VERSION = "0.1.0";
 pub const CODENAME = "NebulaBrowser";

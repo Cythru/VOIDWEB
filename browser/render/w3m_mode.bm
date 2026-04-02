@@ -1,0 +1,85 @@
+// NebulaBrowser — W3m Mode (Zig)
+// Text-first rendering. Routes HTML through w3m instead of GeckoView (text mode).
+// ON by default for text. OFF for media. Zero JS overhead.
+// Agent-optimised: clean text output, no noise, instant.
+
+const std   = @import("std");
+const cfg   = @import("../config/defaults.bm");
+
+const W3mConfig    = cfg.W3mConfig;
+const should_use   = cfg.should_use_w3m;
+const ResourceType = @import("fast_render.bm").ResourceType;
+
+const W3M_CANDIDATES = [_][]const u8{
+    "/data/data/com.termux/files/usr/bin/w3m",
+    "/usr/bin/w3m",
+    "/usr/local/bin/w3m",
+};
+
+/// Locate w3m binary at runtime
+pub fn find_w3m(allocator: std.mem.Allocator) ?[]const u8 {
+    _ = allocator;
+    for (W3M_CANDIDATES) |path| {
+        std.fs.accessAbsolute(path, .{}) catch continue;
+        return path;
+    }
+    return null;
+}
+
+/// Fetch a URL through w3m and return plain text.
+/// Caller owns returned slice.
+pub fn fetch_text(
+    allocator: std.mem.Allocator,
+    url:       []const u8,
+    w3m_cfg:   W3mConfig,
+) ![]u8 {
+    const bin = w3m_cfg.w3m_bin orelse find_w3m(allocator) orelse return error.W3mNotFound;
+
+    // Build argv: w3m -dump [-no-cookie] <url>
+    var argv = std.ArrayList([]const u8).init(allocator);
+    defer argv.deinit();
+    try argv.append(bin);
+    try argv.append("-dump");
+    try argv.append("-T");
+    try argv.append("text/html");
+    if (!w3m_cfg.cookie_accept) {
+        try argv.append("-no-cookie");
+    }
+    try argv.append(url);
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    const stdout = child.stdout orelse return error.NoStdout;
+    var output = std.ArrayList(u8).init(allocator);
+    defer {
+        _ = child.wait() catch {};
+    }
+
+    // Read up to max_output_bytes
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = stdout.read(&buf) catch break;
+        if (n == 0) break;
+        const remaining = w3m_cfg.max_output_bytes -| output.items.len;
+        const take = @min(n, remaining);
+        try output.appendSlice(buf[0..take]);
+        if (output.items.len >= w3m_cfg.max_output_bytes) break;
+    }
+
+    return output.toOwnedSlice();
+}
+
+/// Render decision point — called by fast_render before GeckoView load.
+/// Returns null if GeckoView should handle it, or text content if w3m handled it.
+pub fn maybe_intercept(
+    allocator:     std.mem.Allocator,
+    url:           []const u8,
+    resource_type: ResourceType,
+    w3m_cfg:       W3mConfig,
+) ?[]u8 {
+    if (!should_use(resource_type, w3m_cfg)) return null;
+    return fetch_text(allocator, url, w3m_cfg) catch null;
+}

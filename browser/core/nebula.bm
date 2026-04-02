@@ -1,5 +1,5 @@
 // NebulaBrowser — Core Browser Engine
-// Built on CEF (Chromium Embedded Framework) for full web compatibility.
+// Built on GeckoView (Firefox engine) for full web compatibility.
 // Privacy-first: Tor routing, ad blocking, VoidShield malware scanning,
 // open-source frontend redirects, anti-fingerprinting.
 
@@ -114,8 +114,8 @@ public:
         // frontends_ = std::make_unique<FrontendRegistry>();
 
         // 5. Initialize CEF for rendering
-        std::cout << "[nebula] Starting CEF renderer..." << std::endl;
-        // init_cef();
+        std::cout << "[nebula] Starting Firefox/GeckoView renderer..." << std::endl;
+        // init_gecko();
 
         // 6. Open homepage tab
         new_tab(config_.homepage);
@@ -164,7 +164,7 @@ public:
 
         tab->url = final_url;
         tab->state = TabState::Loading;
-        // cef_navigate(tab_id, final_url);
+        // gecko_navigate(tab_id, final_url);
     }
 
     /// Close a tab
@@ -290,7 +290,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Event loop (CEF message loop)
-    // cef_run_message_loop();
+    // gecko_run_event_loop();
 
     return 0;
 }
