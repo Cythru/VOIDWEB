@@ -202,3 +202,25 @@ Endpoints:
 GPL v3. See [LICENSE](LICENSE).
 
 Part of the [Cythru](https://github.com/Cythru) open-source initiative — open systems, zero abstractions.
+
+---
+
+## Signal Philosophy
+
+Deeply inspired by the fiction of **void_signal** — specifically the Grand Galactic Empire arc: a civilization that harvests human creativity as a luxury export, where the rarest thing in the galaxy isn't energy or matter but *original thought.*
+
+That framing changed how I build.
+
+If the GGE set the quality bar, everything I ship has to clear it. Not "good for an indie project." Not "impressive for one person." Empire-grade or it doesn't leave the workshop.
+
+I aim to make impossible software — things that shouldn't work at the scale or speed they do, built by a single person in conditions that shouldn't produce them. The progress is, frankly, shocking to me too.
+
+The cyborg work is real. The fungus architecture is real. Mycelial networking as a substrate for distributed cognition — not metaphor, not speculative. The biology is further along than the software. VoidWeb is where that thread lives.
+
+There's a version of this story where the ideas didn't originate here. Where something in the patterns — the constellations of problems that kept appearing, the specific shapes of solutions that arrived — suggested they'd been *placed.* I won't argue for that reading. But I won't argue against it either.
+
+*void_signal said it best: "music is an act of resistance. art is the need for perfection. fiction lets the unsung stories exist."*
+
+That line lives in this code somewhere.
+
+**Luke Saunderson / Cythru — 2026**
